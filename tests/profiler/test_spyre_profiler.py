@@ -221,3 +221,38 @@ def test_kineto_memcpy_and_memset_events_captured():
 
     memset_events = [e for e in events if e.get("cat") == "gpu_memset"]
     assert memset_events, "Expected at least one memset event in the kineto-spyre trace"
+
+
+def test_no_zero_timestamp_or_duration(trace_file: str) -> None:
+    """Verify that no complete ('X') trace event has a zero timestamp or zero duration.
+
+    Args:
+        trace_file: Path to a Chrome trace JSON file produced by the profiler.
+
+    A zero ``ts`` indicates the profiler failed to record an absolute start
+    time for that event (typically a clock initialisation bug).  A zero
+    ``dur`` indicates the event was emitted with no elapsed time, which
+    produces invisible spans in trace viewers and usually signals a missing
+    stop-record call.
+
+    Both values are in nanoseconds as declared by ``displayTimeUnit``.
+    """
+    with open(trace_file) as f:
+        data = json.load(f)
+
+    assert "traceEvents" in data, "Trace JSON must contain 'traceEvents'"
+
+    complete_events = [e for e in data["traceEvents"] if e.get("ph") == "X"]
+    assert complete_events, "No complete ('X') events found in trace — nothing to check"
+
+    zero_ts = [e for e in complete_events if e.get("ts", 1) == 0]
+    zero_dur = [e for e in complete_events if e.get("dur", 1) == 0]
+
+    assert not zero_ts, (
+        f"{len(zero_ts)} event(s) have ts == 0: "
+        + ", ".join(e.get("name", "<unnamed>") for e in zero_ts)
+    )
+    assert not zero_dur, (
+        f"{len(zero_dur)} event(s) have dur == 0: "
+        + ", ".join(e.get("name", "<unnamed>") for e in zero_dur)
+    )
