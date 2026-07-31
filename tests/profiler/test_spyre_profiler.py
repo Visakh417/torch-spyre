@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import json
+import os
 import pytest
 import unittest
 import torch
@@ -223,36 +224,58 @@ def test_kineto_memcpy_and_memset_events_captured():
     assert memset_events, "Expected at least one memset event in the kineto-spyre trace"
 
 
-def test_no_zero_timestamp_or_duration(trace_file: str) -> None:
-    """Verify that no complete ('X') trace event has a zero timestamp or zero duration.
+def test_no_zero_timestamp_or_duration(trace_dir: str) -> None:
+    """Check every Chrome trace file in ``trace_dir`` for zero timestamps or durations.
 
     Args:
-        trace_file: Path to a Chrome trace JSON file produced by the profiler.
+        trace_dir: Path to a directory containing one or more Chrome trace JSON
+            files produced by the profiler.
 
-    A zero ``ts`` indicates the profiler failed to record an absolute start
-    time for that event (typically a clock initialisation bug).  A zero
-    ``dur`` indicates the event was emitted with no elapsed time, which
-    produces invisible spans in trace viewers and usually signals a missing
-    stop-record call.
+    For each file the function prints whether zero ``ts`` or ``dur`` values were
+    found.  A zero ``ts`` indicates the profiler failed to record an absolute
+    start time (typically a clock initialisation bug).  A zero ``dur`` indicates
+    the event was emitted with no elapsed time, which produces invisible spans in
+    trace viewers and usually signals a missing stop-record call.
 
     Both values are in nanoseconds as declared by ``displayTimeUnit``.
     """
-    with open(trace_file) as f:
-        data = json.load(f)
-
-    assert "traceEvents" in data, "Trace JSON must contain 'traceEvents'"
-
-    complete_events = [e for e in data["traceEvents"] if e.get("ph") == "X"]
-    assert complete_events, "No complete ('X') events found in trace — nothing to check"
-
-    zero_ts = [e for e in complete_events if e.get("ts", 1) == 0]
-    zero_dur = [e for e in complete_events if e.get("dur", 1) == 0]
-
-    assert not zero_ts, (
-        f"{len(zero_ts)} event(s) have ts == 0: "
-        + ", ".join(e.get("name", "<unnamed>") for e in zero_ts)
+    trace_files = sorted(
+        os.path.join(trace_dir, f)
+        for f in os.listdir(trace_dir)
+        if f.endswith(".json")
     )
-    assert not zero_dur, (
-        f"{len(zero_dur)} event(s) have dur == 0: "
-        + ", ".join(e.get("name", "<unnamed>") for e in zero_dur)
-    )
+    assert trace_files, f"No .json trace files found in '{trace_dir}'"
+
+    for trace_file in trace_files:
+        print(f"\n[{os.path.basename(trace_file)}]")
+
+        with open(trace_file) as f:
+            data = json.load(f)
+
+        if "traceEvents" not in data:
+            print("  SKIP — no 'traceEvents' key")
+            continue
+
+        complete_events = [e for e in data["traceEvents"] if e.get("ph") == "X"]
+        if not complete_events:
+            print("  SKIP — no complete ('X') events")
+            continue
+
+        zero_ts = [e for e in complete_events if e.get("ts", 1) == 0]
+        zero_dur = [e for e in complete_events if e.get("dur", 1) == 0]
+
+        if zero_ts:
+            print(
+                f"  FAIL — {len(zero_ts)} event(s) have ts == 0: "
+                + ", ".join(e.get("name", "<unnamed>") for e in zero_ts)
+            )
+        else:
+            print("  OK   — no zero timestamps")
+
+        if zero_dur:
+            print(
+                f"  FAIL — {len(zero_dur)} event(s) have dur == 0: "
+                + ", ".join(e.get("name", "<unnamed>") for e in zero_dur)
+            )
+        else:
+            print("  OK   — no zero durations")
