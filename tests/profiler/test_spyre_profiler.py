@@ -240,9 +240,7 @@ def test_no_zero_timestamp_or_duration(trace_dir: str) -> None:
     Both ``ts`` and ``dur`` are in nanoseconds as declared by ``displayTimeUnit``.
     """
     trace_files = sorted(
-        os.path.join(trace_dir, f)
-        for f in os.listdir(trace_dir)
-        if f.endswith(".json")
+        os.path.join(trace_dir, f) for f in os.listdir(trace_dir) if f.endswith(".json")
     )
     assert trace_files, f"No .json trace files found in '{trace_dir}'"
 
@@ -274,22 +272,28 @@ def test_no_zero_timestamp_or_duration(trace_dir: str) -> None:
         # --- gpu_memcpy: HtoD and DtoH with dur == 0 ---
         memcpy_events = [e for e in complete_events if e.get("cat") == "gpu_memcpy"]
         htod_zero = [
-            e for e in memcpy_events
+            e
+            for e in memcpy_events
             if "HtoD" in e.get("name", "") and e.get("dur", 1) == 0
         ]
         dtoh_zero = [
-            e for e in memcpy_events
+            e
+            for e in memcpy_events
             if "DtoH" in e.get("name", "") and e.get("dur", 1) == 0
         ]
         if htod_zero:
-            print(f"  FAIL — {len(htod_zero)} HtoD memcpy event(s) have dur == 0: "
-                  + ", ".join(e.get("name", "<unnamed>") for e in htod_zero))
+            print(
+                f"  FAIL — {len(htod_zero)} HtoD memcpy event(s) have dur == 0: "
+                + ", ".join(e.get("name", "<unnamed>") for e in htod_zero)
+            )
         else:
             print("  OK   — no zero-duration HtoD memcpy events")
 
         if dtoh_zero:
-            print(f"  FAIL — {len(dtoh_zero)} DtoH memcpy event(s) have dur == 0: "
-                  + ", ".join(e.get("name", "<unnamed>") for e in dtoh_zero))
+            print(
+                f"  FAIL — {len(dtoh_zero)} DtoH memcpy event(s) have dur == 0: "
+                + ", ".join(e.get("name", "<unnamed>") for e in dtoh_zero)
+            )
         else:
             print("  OK   — no zero-duration DtoH memcpy events")
 
