@@ -27,7 +27,7 @@ KTIR emitter is simply the first such consumer (hence the KTIR references
 below); future emitters are intended to share them, which is why the module is
 named for the ``OpSpec`` it reads rather than for KTIR.
 
-``__all__`` is the contract: those four are what a consumer may import.  Anything
+``__all__`` is the contract: those names are what a consumer may import.  Anything
 underscore-prefixed is a step inside one of them -- reachable from a test, but not
 something to build on.
 """
@@ -35,69 +35,32 @@ something to build on.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Any
 
 import sympy
 from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 
-from torch_spyre._inductor.op_spec import Expr, OpSpec, TensorArg
+from torch_spyre._inductor.op_spec import OpSpec, TensorArg
 
 __all__ = [
+    "PARALLEL",
+    "REDUCTION",
     "align_reshape_plan",
     "buf_id",
+    "core_divisions",
+    "per_core_extent",
+    "placeholder_axes",
+    "reduction_indexing",
     "row_major_strides",
-    "symbolic_dim_max",
 ]
 
 
-def row_major_strides(device_size: Sequence[Any]) -> list[Any]:
-    """Row-major (C-contiguous) strides for a device-size list.
-
-    A symbolic extent is carried through rather than rejected: a stride is the
-    product of the extents inside it, so a symbolic extent leaves every stride
-    *inside* it an integer and makes the ones outside it expressions.  An
-    all-integer size therefore still gets plain ``int`` strides.
-    """
+def row_major_strides(device_size: Sequence[int]) -> list[int]:
+    """Row-major (C-contiguous) strides for a device-size list."""
     n = len(device_size)
-    strides: list[Any] = [1] * n
+    strides = [1] * n
     for i in range(n - 2, -1, -1):
-        product = strides[i + 1] * device_size[i + 1]
-        try:
-            strides[i] = int(product)
-        except TypeError:  # a sympy expression over an unresolved dim
-            strides[i] = product
+        strides[i] = strides[i + 1] * int(device_size[i + 1])
     return strides
-
-
-def symbolic_dim_max(expr: Expr, symbolic_dim_bounds: dict) -> int:
-    """``expr`` with every symbolic dim replaced by its maximum, as an int.
-
-    ``OpSpec.symbolic_dim_bounds`` maps a PyTorch symbol *name* to
-    ``(max, granularity)``, computed from the ShapeEnv at codegen time and
-    serialized as plain ints, so this works during the reload phase when the
-    ShapeEnv is gone.  Baking the max over-allocates but needs nothing at run
-    time, which is why both emitters offer it.
-
-    Note for anyone unifying this with ``superdsc._resolve_sdsc_size``: that one
-    returns the first symbol's max *directly* (so it answers ``s0`` for ``s0 + 1``)
-    and falls back to a live-ShapeEnv hint when the symbol is unbounded.  This one
-    substitutes into the whole expression and raises instead of guessing, so the
-    two are not interchangeable without deciding which behaviour is wanted.
-    """
-    resolved = expr
-    for symbol in {str(s) for s in getattr(expr, "free_symbols", ())}:
-        if symbol not in symbolic_dim_bounds:
-            raise NotImplementedError(
-                f"extent {expr} has no bound for {symbol!r} in symbolic_dim_bounds"
-            )
-        resolved = resolved.subs({symbol: int(symbolic_dim_bounds[symbol][0])})
-    try:
-        return int(resolved)
-    except TypeError:
-        raise NotImplementedError(
-            f"extent {expr} does not become an integer under its bounds "
-            f"{symbolic_dim_bounds!r}"
-        ) from None
 
 
 def buf_id(arg: TensorArg) -> str:
@@ -278,3 +241,226 @@ def align_reshape_plan(
         )
     broadcast_to = out_block if reshape_to != out_block else None
     return (reshape_to, broadcast_to)
+
+
+def placeholder_axes(
+    coords: Sequence[sympy.Expr], extent: Sequence[int]
+) -> tuple[int, ...]:
+    """Output axes standing in for something the op does not write.
+
+    A projection keeps an axis the op does not produce in the output's
+    ``device_size`` as a unit extent at a constant coordinate, so the output is
+    the same rank as the input even though it carries less.  A consumer wants
+    those axes gone: the accepted KTIR form stores a rank-2 tile into a rank-2
+    view, and keeping them would demand a reshape between the compute op and the
+    store.
+
+    **Unary on purpose** -- it asks nothing about the inputs.  A constant
+    coordinate alone does not identify a placeholder: an on-stick reduction's
+    output carries *two* constant coordinates, one a placeholder and one the
+    broadcast lane the store really walks, and only the extent separates them.
+    Folding this into a relational helper is what made the on-stick shape reach a
+    coordinate-matching refusal before anyone could ask the unary question.
+    """
+    return tuple(
+        axis
+        for axis, coord in enumerate(coords)
+        if _dim_info(coord)[0] == _DIM_CONST and int(extent[axis]) == 1
+    )
+
+
+# The two ``linalg`` iterator names, as ``iterator_types`` spells them.  Produced
+# here because ``reduction_indexing`` is what decides which dim is which; a
+# consumer that builds a ``linalg.generic`` passes them through unchanged.
+PARALLEL = "parallel"
+REDUCTION = "reduction"
+
+
+def reduction_indexing(
+    in_coords: Sequence[sympy.Expr],
+    in_extent: Sequence[int],
+    out_coords: Sequence[sympy.Expr],
+    out_extent: Sequence[int],
+) -> tuple[tuple[str, ...], tuple[int, ...], tuple[int, ...]]:
+    """``(iters, in_map, out_map)`` for one unary reduction over a squeezed output.
+
+    The iteration nest a reduction wants, stated as the three things a
+    ``linalg.generic`` would have to say and a ``linalg.reduce`` says implicitly:
+    one iterator per iteration dim, and per operand one dim index per result
+    position (a *projection*, so ``(0, 1, 2)`` is ``(d0..d3) -> (d0,d1,d2)``).
+    Plain tuples rather than dialect types, so this module keeps knowing nothing
+    about MLIR.
+
+    An iteration dim is a distinct ``(kind, sym)`` classification of a device
+    coordinate (see ``_dim_info``), numbered in the order the *input* axes
+    introduce them.  Two things follow that a set-complement over kept axes
+    cannot express:
+
+    * an output axis whose coordinate is a bare constant of extent > 1 is not a
+      placeholder but a **broadcast lane** -- a real iteration dim the store walks
+      that the input does not have -- so it gets a fresh dim rather than a
+      refusal.  That is the whole on-stick reduction, and the axis a reduction
+      reduces on the way in can therefore be kept on the way out.
+    * an axis can be both, which is why the answer is per-operand maps and not a
+      flat list of reduced axes.
+
+    ``out_coords``/``out_extent`` must already have their placeholder axes dropped
+    (``placeholder_axes``): an extent-1 constant would otherwise be
+    indistinguishable from a degenerate broadcast lane.
+
+    Refuses three shapes, each of which would otherwise read the wrong elements
+    silently: a kept axis that matches no input axis or matches one out of
+    increasing order (that is a transpose, which needs a restickify); a kept axis
+    whose extent changed; and a nest in which nothing reduces at all.  The last
+    is not implied by the caller having labelled the spec a reduction -- that says
+    what was *asked for*, this reads what the coordinates *are* -- and without it
+    an all-parallel nest reaches ``dimensions = []``, which does not build.
+    """
+    dims: list[tuple[str, sympy.Symbol | None]] = []
+    extents: list[int] = []
+    in_map: list[int] = []
+    for axis, coord in enumerate(in_coords):
+        info = _dim_info(coord)
+        size = int(in_extent[axis])
+        if info in dims:
+            # A repeated classification is one dim walked twice, so the two axes
+            # must agree about how far it runs.
+            dim = dims.index(info)
+            if extents[dim] != size:
+                raise NotImplementedError(
+                    f"OpSpec reduction: input device axes {in_map.index(dim)} and "
+                    f"{axis} are both {coord!r} but run {extents[dim]} and {size} "
+                    "elements; one iteration dim cannot have two ranges"
+                )
+        else:
+            dims.append(info)
+            extents.append(size)
+            dim = len(dims) - 1
+        in_map.append(dim)
+
+    # Only the dims the input introduced are matchable; anything past this is a
+    # broadcast lane allocated below, and a second one must not match the first.
+    from_input = len(dims)
+    out_map: list[int] = []
+    matched: list[int] = []  # the input dims kept, in output order
+    for axis, coord in enumerate(out_coords):
+        info = _dim_info(coord)
+        size = int(out_extent[axis])
+        if info in dims[:from_input]:
+            dim = dims.index(info)
+            if extents[dim] != size:
+                raise NotImplementedError(
+                    f"OpSpec reduction: kept output axis {axis} has extent {size} "
+                    f"but its input axis has extent {extents[dim]}; a reduction "
+                    "does not resize an axis it keeps"
+                )
+            matched.append(dim)
+        elif info == (_DIM_CONST, None):
+            # The broadcast lane: a real iteration dim with no input axis behind
+            # it.  ``placeholder_axes`` has already taken the extent-1 constants,
+            # so what is left here carries elements.
+            dims.append(info)
+            extents.append(size)
+            dim = len(dims) - 1
+        else:
+            raise NotImplementedError(
+                f"OpSpec reduction: output device axis {axis} ({coord!r}) matches "
+                "no input axis; the surviving axes are permuted, which needs a "
+                "transpose rather than a reduction"
+            )
+        out_map.append(dim)
+
+    # A pure reduction preserves the row-major order of the axes it keeps.
+    if any(matched[i] >= matched[i + 1] for i in range(len(matched) - 1)):
+        raise NotImplementedError(
+            "OpSpec reduction: the surviving axes are permuted, which needs a "
+            "transpose rather than a reduction"
+        )
+    reduced = set(range(len(dims))) - set(out_map)
+    if not reduced:
+        raise NotImplementedError(
+            "OpSpec reduction: the output carries every input device axis, so "
+            "there is no axis to reduce"
+        )
+    iters = tuple(REDUCTION if dim in reduced else PARALLEL for dim in range(len(dims)))
+    return iters, tuple(in_map), tuple(out_map)
+
+
+# ---------------------------------------------------------------------------
+# Work division: the core grid, as the iteration space states it
+# ---------------------------------------------------------------------------
+
+
+def core_divisions(
+    iteration_space: dict[sympy.Symbol, tuple[sympy.Expr, int]],
+) -> tuple[list[tuple[sympy.Symbol, int, int]], int]:
+    """``(divisions, total_cores)`` for one iteration space.
+
+    ``OpSpec.iteration_space`` maps each symbol to ``(range, work_division)``,
+    where the division is the number of cores that symbol's range is split
+    across -- decided upstream by ``work_division.py`` from ``config.sencores``.
+    The core grid is one flat index in ``[0, total_cores)``, read as a mixed-radix
+    number over the divided symbols, so each division is returned as
+    ``(sym, div, inner)`` **innermost-first**: that symbol's portion of the grid
+    is ``(core_id // inner) % div``.
+
+    ``total_cores`` is the product of the divisions, so an undivided space gives
+    ``([], 1)`` -- a single-core kernel, stated by the contract rather than
+    assumed.
+    """
+    split = [
+        (sym, int(div)) for sym, (_range, div) in iteration_space.items() if div > 1
+    ]
+    total_cores = 1
+    for _sym, div in split:
+        total_cores *= div
+    divisions: list[tuple[sympy.Symbol, int, int]] = []
+    inner = 1
+    for sym, div in reversed(split):  # innermost first
+        divisions.append((sym, div, inner))
+        inner *= div
+    return divisions, total_cores
+
+
+def per_core_extent(
+    arg: TensorArg, divisors: dict[sympy.Symbol, int]
+) -> tuple[list[int], list[sympy.Symbol | None]]:
+    """``(extent, symbol)`` per device axis: one core's share, and what divides it.
+
+    Each device axis carries at most one iteration symbol -- a bare ``c_i`` or an
+    outer-stick ``c_i // stick`` -- so at most one divisor applies to it, and the
+    axis' per-core extent is its full extent divided by that divisor.  The
+    trailing axis is the within-stick one and is never divided: a stick is the
+    unit of transfer, so splitting it across cores would split a stick.
+
+    The returned symbol list says which division each axis follows (``None`` for
+    an axis no division touches), which is what turns a division into a step
+    along that axis.
+    """
+    extent = [int(s) for s in arg.device_size]
+    coords = list(arg.device_coordinates)
+    if divisors and len(coords) != len(extent):
+        raise NotImplementedError(
+            f"OpSpec work division: {arg.name!r} carries {len(coords)} device "
+            f"coordinate(s) for {len(extent)} device axes, so which axis a "
+            "divided symbol walks cannot be told"
+        )
+    per_core: list[int] = []
+    symbols: list[sympy.Symbol | None] = []
+    last = len(extent) - 1
+    for axis, size in enumerate(extent):
+        symbol = None
+        if divisors and axis != last:
+            kind, symbol = _dim_info(coords[axis])
+            if kind == _DIM_CONST:
+                symbol = None
+        divisor = divisors.get(symbol, 1) if symbol is not None else 1
+        if divisor > 1 and size % divisor:
+            raise NotImplementedError(
+                f"OpSpec work division: device axis {axis} of {arg.name!r} has "
+                f"extent {size}, which {divisor} cores do not divide evenly; a "
+                "ragged per-core tile is not supported"
+            )
+        per_core.append(size // divisor)
+        symbols.append(symbol if divisor > 1 else None)
+    return per_core, symbols

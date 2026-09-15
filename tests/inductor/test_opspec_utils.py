@@ -31,10 +31,16 @@ from torch_spyre._inductor.codegen.opspec_utils import (
     _DIM_CONST,
     _DIM_OUTER_STICK,
     _DIM_WITHIN_STICK,
+    PARALLEL,
+    REDUCTION,
     _dim_info,
     _iteration_space_key,
     align_reshape_plan,
     buf_id,
+    core_divisions,
+    per_core_extent,
+    placeholder_axes,
+    reduction_indexing,
     row_major_strides,
 )
 from torch_spyre._inductor.op_spec import OpSpec, TensorArg
@@ -197,6 +203,196 @@ class TestAlignReshapePlan(unittest.TestCase):
                 [d, sympy.Mod(c, 64)],
                 [4, 64],
             )
+
+
+class TestCoreDivisions(unittest.TestCase):
+    """The grid, read off the iteration space's per-symbol work division."""
+
+    def test_undivided_is_one_core(self):
+        d0, d1 = sympy.symbols("d0 d1")
+        self.assertEqual(core_divisions({d0: (16, 1), d1: (512, 1)}), ([], 1))
+
+    def test_one_divided_symbol_owns_the_whole_grid(self):
+        d0, d1 = sympy.symbols("d0 d1")
+        divisions, cores = core_divisions({d0: (16, 1), d1: (512, 32)})
+        self.assertEqual(cores, 32)
+        self.assertEqual(divisions, [(d1, 32, 1)])
+
+    def test_two_divided_symbols_are_mixed_radix_innermost_first(self):
+        """``inner`` is the grid stride of one step of that symbol, so the flat
+        id decodes as ``(id // inner) % div``."""
+        d0, d1 = sympy.symbols("d0 d1")
+        divisions, cores = core_divisions({d0: (16, 2), d1: (512, 4)})
+        self.assertEqual(cores, 8)
+        self.assertEqual(divisions, [(d1, 4, 1), (d0, 2, 4)])
+
+
+class TestPerCoreExtent(unittest.TestCase):
+    """One core's share of each device axis, and which division it follows."""
+
+    @staticmethod
+    def _arg(size, coords):
+        return TensorArg(
+            is_input=True,
+            arg_index=0,
+            device_dtype=DataFormats.SEN169_FP16,
+            device_size=size,
+            device_coordinates=coords,
+            allocation={"hbm": None},
+            name="arg0",
+        )
+
+    def test_undivided_is_the_whole_extent(self):
+        d0, d1 = sympy.symbols("d0 d1")
+        arg = self._arg([16, 512, 64], [d0, d1, sympy.Mod(d1, 64)])
+        self.assertEqual(per_core_extent(arg, {}), ([16, 512, 64], [None, None, None]))
+
+    def test_a_divided_axis_shrinks_and_names_its_symbol(self):
+        d0, d1 = sympy.symbols("d0 d1")
+        arg = self._arg([16, 512, 64], [d0, d1, sympy.Mod(d1, 64)])
+        self.assertEqual(
+            per_core_extent(arg, {d1: 32}), ([16, 16, 64], [None, d1, None])
+        )
+
+    def test_the_within_stick_axis_is_never_divided(self):
+        """A stick is the unit of transfer, so the last axis keeps its extent even
+        when its symbol is divided."""
+        d0 = sympy.symbols("d0")
+        arg = self._arg([32, 64], [sympy.floor(d0 / 64), sympy.Mod(d0, 64)])
+        self.assertEqual(per_core_extent(arg, {d0: 32}), ([1, 64], [d0, None]))
+
+    def test_a_ragged_division_raises(self):
+        d0, d1 = sympy.symbols("d0 d1")
+        arg = self._arg([16, 512, 64], [d0, d1, sympy.Mod(d1, 64)])
+        with self.assertRaises(NotImplementedError):
+            per_core_extent(arg, {d1: 7})
+
+
+class TestPlaceholderAxes(unittest.TestCase):
+    """Which output axes stand in for something the op does not write.
+
+    The rule is about the *extent*, not about reductions: a constant coordinate
+    alone does not say "no elements here".  Both projections below carry a
+    constant coordinate the store really walks, or would if the extent were the
+    only thing consulted -- which is why this helper is unary and separate.
+    """
+
+    def test_a_nonstick_reduction_drops_only_its_unit_axis(self):
+        """``sum(x[256, 2048], dim=0)``: the reduced axis survives in the output
+        as a unit extent at a constant coordinate, and that is the one to go."""
+        lanes = sympy.Symbol("c0")
+        stick, lane = sympy.floor(lanes / 64), sympy.Mod(lanes, 64)
+        self.assertEqual(
+            placeholder_axes([sympy.Integer(0), stick, lane], [1, 32, 64]), (0,)
+        )
+
+    def test_an_on_stick_reduction_keeps_its_broadcast_lane(self):
+        """``sum(x[256, 128], dim=-1)``: device ``[1, 256, 64]`` at coordinates
+        ``[0, c0, 0]``, i.e. **two** constant coordinates meaning different things.
+
+        Axis 0 is the placeholder -- no elements, no stride.  Axis 2 is the
+        broadcast lane, 64 real elements the D2H descriptor gathers across, and
+        dropping it would describe a store of a fraction of the buffer.  Only the
+        extent separates them, so this is the evidence that the rule is about
+        extent rather than about reductions at all.
+        """
+        rows = sympy.Symbol("c0")
+        self.assertEqual(
+            placeholder_axes([sympy.Integer(0), rows, sympy.Integer(0)], [1, 256, 64]),
+            (0,),
+        )
+
+
+class TestReductionIndexing(unittest.TestCase):
+    """The iteration nest a reduction wants, read from the coordinates.
+
+    Both patterns the frontend projects, against a *squeezed* output -- which is
+    the helper's precondition, because an extent-1 constant is otherwise
+    indistinguishable from a degenerate broadcast lane.
+    """
+
+    @staticmethod
+    def _nonstick():
+        """``sum(x[256, 2048], dim=0)``: input ``[32, 256, 64]`` -> ``[32, 64]``.
+
+        The reduced axis (256 rows) sits between the two axes the reduced-over
+        stick index splits, and the output keeps both of those.
+        """
+        lanes, rows = sympy.symbols("c0 c1")
+        stick, lane = sympy.floor(lanes / 64), sympy.Mod(lanes, 64)
+        return ([stick, rows, lane], [32, 256, 64], [stick, lane], [32, 64])
+
+    @staticmethod
+    def _on_stick():
+        """``sum(x[256, 128], dim=-1)``: input ``[2, 256, 64]`` -> ``[256, 64]``.
+
+        The reduction runs along the *stick*, so it consumes both halves of the
+        reduced symbol -- the outer-stick chunk index and the within-stick lane --
+        and the output nonetheless has 64 lanes: a fresh iteration dim with no
+        input axis behind it.
+        """
+        rows, reduced = sympy.symbols("c0 c1")
+        stick, lane = sympy.floor(reduced / 64), sympy.Mod(reduced, 64)
+        return (
+            [stick, rows, lane],
+            [2, 256, 64],
+            [rows, sympy.Integer(0)],
+            [256, 64],
+        )
+
+    def test_a_nonstick_reduction_is_one_reduced_dim(self):
+        """Identity input map, output map the identity with dim 1 dropped -- which
+        is exactly what ``linalg.reduce ... dimensions = [1]`` states."""
+        iters, in_map, out_map = reduction_indexing(*self._nonstick())
+        self.assertEqual(iters, (PARALLEL, REDUCTION, PARALLEL))
+        self.assertEqual(in_map, (0, 1, 2))
+        self.assertEqual(out_map, (0, 2))
+
+    def test_an_on_stick_reduction_reduces_a_dim_and_keeps_a_lane(self):
+        """Two reduced dims, a rank-3 input map against a rank-4 nest, and a dim
+        (3) the output has that the input does not.
+
+        This is the shape a set complement over kept axes cannot state: the lane
+        axis is reduced on the way in and written on the way out, so no flat list
+        of reduced axes describes it and the answer has to be per-operand maps.
+        """
+        iters, in_map, out_map = reduction_indexing(*self._on_stick())
+        self.assertEqual(iters, (REDUCTION, PARALLEL, REDUCTION, PARALLEL))
+        self.assertEqual(in_map, (0, 1, 2))
+        self.assertEqual(out_map, (1, 3))
+
+    def test_nothing_reduced_raises(self):
+        """Not implied by the caller calling it a reduction: that is what was
+        asked for, this is what the coordinates say.  An all-parallel nest would
+        reach ``dimensions = []``, which does not build."""
+        lanes, rows = sympy.symbols("c0 c1")
+        with self.assertRaises(NotImplementedError) as ctx:
+            reduction_indexing([rows, lanes], [256, 64], [rows, lanes], [256, 64])
+        self.assertIn("no axis to reduce", str(ctx.exception))
+
+    def test_a_resized_kept_axis_raises(self):
+        """A kept axis whose extent changed is not a reduction of the others."""
+        in_coords, in_extent, out_coords, _ = self._nonstick()
+        with self.assertRaises(NotImplementedError) as ctx:
+            reduction_indexing(in_coords, in_extent, out_coords, [16, 64])
+        self.assertIn("does not resize", str(ctx.exception))
+
+    def test_permuted_or_unmatched_kept_axes_raise(self):
+        """A kept axis out of increasing order, or matching no input axis at all:
+        both are a transpose (restickify), not a reduction."""
+        lanes, rows = sympy.symbols("c0 c1")
+        stick, lane = sympy.floor(lanes / 64), sympy.Mod(lanes, 64)
+        elsewhere = sympy.Symbol("d9")
+        for out_coords, out_extent in (
+            ([lane, stick], [64, 32]),  # matched in decreasing order
+            ([elsewhere, lane], [32, 64]),  # a symbol the input does not carry
+        ):
+            with self.subTest(out_coords=out_coords):
+                with self.assertRaises(NotImplementedError) as ctx:
+                    reduction_indexing(
+                        [stick, rows, lane], [32, 256, 64], out_coords, out_extent
+                    )
+                self.assertIn("transpose", str(ctx.exception))
 
 
 if __name__ == "__main__":

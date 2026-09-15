@@ -71,16 +71,19 @@ def make_op_spec(
     size: list = ADD_SIZE,
     sizes: list | None = None,
     coords: list | None = None,
+    coords_per_arg: list | None = None,
     dtype: DataFormats = FP16,
     allocations: list | None = None,
     baked: bool = False,
     advances: list | None = None,
+    kernel_locals: list | None = None,
     is_reduction: bool = False,
     divisions: dict | None = None,
     space: dict | None = None,
     tiled: list | None = None,
     trips: dict | None = None,
     first_arg_index: int = 0,
+    op_info: dict | None = None,
 ) -> OpSpec:
     """A finished ``OpSpec``, defaulting to ``a + b`` at [16, 512, 64] fp16.
 
@@ -92,15 +95,23 @@ def make_op_spec(
     The deviations, each a keyword:
 
     * ``op`` / ``inputs`` / ``outputs`` / ``names`` -- the op and its roles.
-    * ``size`` for every arg, or ``sizes`` per arg; ``coords=[]`` for a tiled arg,
-      which addresses through ``advances`` instead of coordinates.
+    * ``size`` for every arg, or ``sizes`` per arg; likewise ``coords`` for every
+      arg or ``coords_per_arg`` for one list each, which a reduction needs because
+      its output drops an axis.  ``coords=[]`` is a tiled arg, addressing through
+      ``advances`` instead of coordinates.
     * ``allocations`` per arg, for an ``lx`` / ``hbm_pool`` intermediate or an
       unrecognised space; ``baked=True`` for the byte HBM address the baked form
       wants, which is the same field said the other way, so not both.
+    * ``kernel_locals`` per arg: the bit the scheduler fills, saying nothing
+      outside this kernel reads the buffer.  Defaults to False, as it does in
+      the contract.
     * ``divisions`` maps a coordinate symbol's name to its work division;
       ``space`` replaces the iteration space outright (``{}`` for a tiled op).
     * ``tiled`` / ``trips`` are the loop-level symbols and trip counts, and
       ``first_arg_index`` continues the numbering for a second op in one kernel.
+    * ``op_info`` is the op's auxiliary dict, which the recipes that take scalar
+      arguments read (softplus's beta/threshold live in ``op_info["constants"]``);
+      it defaults to empty, which every other op wants.
     """
     if allocations and baked:
         raise ValueError("make_op_spec: pass allocations= or baked=, not both")
@@ -123,21 +134,23 @@ def make_op_spec(
             if allocation is None:
                 allocation = {"hbm": arg_index << 34 if baked else None}
         arg_size = at(sizes, position) or size
+        arg_coords = at(coords_per_arg, position)
+        if arg_coords is None:
+            arg_coords = (
+                sympy.symbols(f"d0:{len(arg_size)}") if coords is None else coords
+            )
         args.append(
             TensorArg(
                 is_input=is_input,
                 arg_index=arg_index,
                 device_dtype=dtype,
                 device_size=list(arg_size),
-                device_coordinates=(
-                    list(sympy.symbols(f"d0:{len(arg_size)}"))
-                    if coords is None
-                    else list(coords)
-                ),
+                device_coordinates=list(arg_coords),
                 allocation=allocation,
                 name=at(names, position)
                 or (f"arg{ordinal}" if is_input else f"buf{ordinal}"),
                 device_tile_advance_expr=at(advances, position),
+                kernel_local=bool(at(kernel_locals, position)),
             )
         )
 
@@ -152,7 +165,7 @@ def make_op_spec(
         is_reduction=is_reduction,
         iteration_space=space,
         args=args,
-        op_info={},
+        op_info=op_info or {},
         tiled_symbols=tiled or [],
         tiled_symbol_trip_counts=trips or {},
     )
@@ -217,6 +230,160 @@ def make_nested_op_spec(*, levels: list, **overrides) -> tuple:
     return loops[0], spec, loops
 
 
+def make_onstick_sum_specs() -> list:
+    """``sum(x[256, 128], dim=-1)`` on one core, as the frontend projects it.
+
+    The reduction runs along the *stick*, so it consumes both halves of the
+    reduced symbol -- the outer-stick chunk index ``floor(c1 / 64)`` and the
+    within-stick lane ``c1 % 64`` -- and the output nonetheless has 64 lanes at a
+    constant coordinate.  Every number here is the frontend's own: device sizes
+    [2, 256, 64] in and [1, 256, 64] out, the output's axis 0 a placeholder and
+    its axis 2 the lane the D2H descriptor gathers across.
+
+    Shared rather than local to one test class because both halves of the suite
+    want it: the dialect-free plan assertions here, and the golden in
+    ``test_ktir_emitter.py``.
+    """
+    rows, reduced = sympy.symbols("c0 c1")
+    stick, lane = sympy.floor(reduced / 64), sympy.Mod(reduced, 64)
+    return [
+        make_op_spec(
+            "sum",
+            is_reduction=True,
+            inputs=1,
+            sizes=[[2, 256, 64], [1, 256, 64]],
+            coords_per_arg=[
+                [stick, rows, lane],
+                [sympy.Integer(0), rows, sympy.Integer(0)],
+            ],
+            space={rows: (256, 1), reduced: (128, 1)},
+        )
+    ]
+
+
+def make_linked_op_specs(
+    ops: tuple = ("abs", "max"),
+    *,
+    reductions: tuple = (False, True),
+    edges: tuple = ((0, 1),),
+    dangling: tuple = (),
+    prefixes: tuple | None = None,
+    link: dict | None = None,
+    links: dict | None = None,
+    link_local: bool = True,
+    out_sizes: dict | None = None,
+    out_coords: dict | None = None,
+    in_sizes: dict | None = None,
+    onstick: bool = False,
+    chunks: int | None = None,
+    rows: int = 256,
+    lanes: int = 64,
+    dtype: DataFormats = FP16,
+    row_division: int = 1,
+) -> list:
+    """A kernel's OpSpec vector described TOPOLOGICALLY: stages and their links.
+
+    Every link is ``kernel_local`` -- nothing outside the kernel reads it, which
+    is what a link is -- unless ``link_local=False`` says the scheduler found a
+    reader elsewhere.
+    """
+    if len(ops) != len(reductions):
+        raise ValueError("make_linked_op_specs: one reduction flag per op")
+    prefixes = prefixes or tuple(chr(ord("d") + index) for index in range(len(ops)))
+    link = link or ({"lx": 0x1000} if onstick else {"hbm_pool": 0x2000})
+    links, out_sizes, out_coords, in_sizes = (
+        links or {},
+        out_sizes or {},
+        out_coords or {},
+        in_sizes or {},
+    )
+    chunks = (2 if onstick else 64) if chunks is None else chunks
+    full_size = [chunks, rows, lanes]
+    reduced_size = [1, rows, lanes]
+
+    def geometry(prefix: str) -> tuple[list, list, dict]:
+        """One stage's coordinates for a full and a reduced buffer, and its space."""
+        s0, s1, s2 = sympy.symbols(f"{prefix}0:3")
+        if onstick:
+            full = [sympy.floor(s1 / lanes), s0, sympy.Mod(s1, lanes)]
+            reduced = [sympy.Integer(0), s0, sympy.Integer(0)]
+            space = {s0: (rows, row_division), s1: (chunks * lanes, 1)}
+        else:
+            full = [s0, s1, s2]
+            reduced = [sympy.Integer(0), s1, s2]
+            space = {s0: (chunks, 1), s1: (rows, row_division), s2: (lanes, 1)}
+        return full, reduced, space
+
+    specs: list = []
+    next_arg = 0
+    for index, op in enumerate(ops):
+        full, reduced, space = geometry(prefixes[index])
+        incoming = [producer for producer, consumer in edges if consumer == index]
+        outgoing = index in dangling or any(producer == index for producer, _ in edges)
+        if incoming:
+            names = [f"t{producer}" for producer in incoming]
+            allocations = [dict(links.get(producer, link)) for producer in incoming]
+            # A read is described at the extent its producer wrote, in the
+            # READER's symbols: whose description is kept is the fuser's problem,
+            # so the fixture must not make the two accidentally identical.
+            sizes = [
+                in_sizes.get(index)
+                or (reduced_size if reductions[producer] else full_size)
+                for producer in incoming
+            ]
+            coords = [
+                reduced if reductions[producer] else full for producer in incoming
+            ]
+        else:
+            names, allocations = [f"x{index}"], [None]
+            sizes, coords = [in_sizes.get(index) or full_size], [full]
+        reduction = reductions[index]
+        # A reduction folds axis 0 away; a pointwise stage is the IDENTITY on its
+        # first operand, which is what makes it access-preserving and is why the
+        # result follows that operand rather than the stage's nominal extent.
+        result_size = reduced_size if reduction else sizes[0]
+        result_coords = reduced if reduction else coords[0]
+        spec = make_op_spec(
+            op,
+            inputs=len(names),
+            is_reduction=reduction,
+            names=[*names, f"t{index}" if outgoing else f"out{index}"],
+            sizes=[*sizes, out_sizes.get(index) or result_size],
+            coords_per_arg=[*coords, out_coords.get(index) or result_coords],
+            allocations=[
+                *allocations,
+                dict(links.get(index, link)) if outgoing else None,
+            ],
+            kernel_locals=[
+                *([link_local] * len(names) if incoming else [False]),
+                link_local and bool(outgoing),
+            ],
+            dtype=dtype,
+            space=space,
+            first_arg_index=next_arg,
+        )
+        specs.append(spec)
+        next_arg += sum(1 for arg in spec.args if arg.arg_index >= 0)
+    return specs
+
+
+def make_absmax_pair(**overrides) -> list:
+    """``amax(abs(x), ...)``: shape A, and the only fixture that names the entry."""
+    return make_linked_op_specs(ops=("abs", "max"), **overrides)
+
+
+def make_plan_fusion(**overrides) -> ktir.PlanFusion:
+    """A table entry defined by the test, defaulting to a two-slot collapse."""
+    entry = {
+        "name": "probe",
+        "pattern": (("abs", False), ("max", True)),
+        "result_op": "fused",
+        "why": "a probe entry, defined by the test that uses it",
+    }
+    entry.update(overrides)
+    return ktir.PlanFusion(**entry)  # type: ignore[arg-type]
+
+
 class TestValidateRejections(unittest.TestCase):
     """One test per rejection ``build_kernel_plan`` is responsible for.
 
@@ -238,11 +405,15 @@ class TestValidateRejections(unittest.TestCase):
     def test_empty_spec_list_rejected(self):
         self._rejects([], "no OpSpec to emit")
 
-    def test_work_division_rejected(self):
-        """The grid comes from the contract, so the refusal reads the contract:
-        a symbol the iteration space splits has no grid to emit for yet."""
-        specs = [make_op_spec(divisions={"d1": 32})]
-        self._rejects(specs, "multi-core work division is not supported")
+    def test_mixed_work_division_rejected(self):
+        """Two ops in one kernel, two grids: there is only one grid to emit."""
+        specs = [make_op_spec(), make_op_spec(divisions={"d1": 2})]
+        self._rejects(specs, "different work divisions")
+
+    def test_ragged_work_division_rejected(self):
+        """A division that does not divide the axis evenly has no per-core tile."""
+        specs = [make_op_spec(divisions={"d1": 7})]  # 512 / 7 is not a whole tile
+        self._rejects(specs, "do not divide evenly")
 
     # -- spec-tree shape ---------------------------------------------------
 
@@ -252,10 +423,11 @@ class TestValidateRejections(unittest.TestCase):
     def test_unexpected_entry_rejected(self):
         self._rejects(["not a spec"], "unexpected spec entry str")
 
-    def test_reduction_rejected(self):
-        """A reduction is a second emission shape, not a second binding: refused
-        until a builder method exists for it."""
-        self._rejects([make_op_spec(is_reduction=True)], "reductions are not supported")
+    def test_family_mismatch_rejected(self):
+        """An ``add`` asked for as a reduction: the recipe is what has an
+        emission, so the request is refused rather than emitted elementwise."""
+        specs = [make_op_spec(is_reduction=True)]
+        self._rejects(specs, "registered as NAMED")
 
     def test_unregistered_op_rejected(self):
         """An op with no recipe is rejected, and the message names what exists."""
@@ -331,9 +503,8 @@ class TestRejectionsThroughGenerateKtir(unittest.TestCase):
     ``mlir_ktdp``; they run here precisely because it validates first.
     """
 
-    def test_reduction_unsupported(self):
-        specs = [make_op_spec()]
-        specs[0].is_reduction = True
+    def test_family_mismatch_unsupported(self):
+        specs = [make_op_spec(is_reduction=True)]
         with self.assertRaises(NotImplementedError):
             ktir.generate_ktir("ktir_fused_add_0", specs)
 
@@ -343,10 +514,8 @@ class TestRejectionsThroughGenerateKtir(unittest.TestCase):
         with self.assertRaises(NotImplementedError):
             ktir.generate_ktir("ktir_fused_atan2_0", specs)
 
-    def test_work_division_unsupported(self):
-        specs = [make_op_spec()]
-        d1 = next(s for s in specs[0].iteration_space if str(s) == "d1")
-        specs[0].iteration_space[d1] = (512, 32)
+    def test_ragged_work_division_unsupported(self):
+        specs = [make_op_spec(divisions={"d1": 7})]
         with self.assertRaises(NotImplementedError):
             ktir.generate_ktir("ktir_fused_add_0", specs)
 
@@ -374,6 +543,57 @@ class TestPlanOptions(unittest.TestCase):
             sorted(f.name for f in dataclasses.fields(ktir.PlanOptions)),
             ["bake_addresses"],
         )
+
+
+class TestWorkDivision(unittest.TestCase):
+    """The grid, and the per-core tile, as ``iteration_space`` states them.
+
+    ``work_division.py`` has already turned ``config.sencores`` into a per-symbol
+    division by the time the emitter sees a spec, so the emitter reads the
+    contract and never the config -- the same source the SDSC path reads as its
+    work slices.
+    """
+
+    def test_an_undivided_space_is_one_core(self):
+        plan = ktir.build_kernel_plan([make_op_spec()])
+        self.assertEqual(plan.grid, (1,))
+        self.assertEqual(plan.divisions, ())
+
+    def test_the_grid_is_the_product_of_the_divisions(self):
+        plan = ktir.build_kernel_plan([make_op_spec(divisions={"d1": 32})])
+        self.assertEqual(plan.grid, (32,))
+        self.assertEqual(plan.divisions, (ktir.Division(symbol="d1", div=32, inner=1),))
+
+    def test_two_divided_symbols_are_mixed_radix(self):
+        """Outermost-first, and ``inner`` is that symbol's stride in the grid."""
+        plan = ktir.build_kernel_plan([make_op_spec(divisions={"d0": 2, "d1": 4})])
+        self.assertEqual(plan.grid, (8,))
+        self.assertEqual(
+            plan.divisions,
+            (
+                ktir.Division(symbol="d0", div=2, inner=4),
+                ktir.Division(symbol="d1", div=4, inner=1),
+            ),
+        )
+
+    def test_the_tile_shrinks_and_the_view_does_not(self):
+        """One core's tile is its share; every core addresses the whole buffer."""
+        plan = ktir.build_kernel_plan([make_op_spec(divisions={"d1": 32})])
+        for buffer in plan.parameters:
+            with self.subTest(buf_id=buffer.buf_id):
+                self.assertEqual(buffer.layout.extent, (16, 512, 64))
+        step = plan.steps[0]
+        self.assertEqual(step.out.extent, (16, 16, 64))  # 512 / 32 rows
+        # The division walks dim 1 in per-core-extent steps, and nothing else.
+        self.assertEqual(step.out.index_coeffs, ((0,), (16,), (0,)))
+
+    def test_a_division_no_output_axis_follows_is_rejected(self):
+        """A stick is the unit of transfer, so the lane axis is never divided --
+        which leaves a division of the lane symbol with no axis to walk, and every
+        core writing the same elements.  Refused rather than silently duplicated."""
+        with self.assertRaises(NotImplementedError) as ctx:
+            ktir.build_kernel_plan([make_op_spec(divisions={"d2": 2})])
+        self.assertIn("no device axis of the output", str(ctx.exception))
 
 
 class TestKernelPlan(unittest.TestCase):
@@ -408,10 +628,6 @@ class TestKernelPlan(unittest.TestCase):
             [e.base_elements for e in plan.parameters],
             [0, (1 << 34) // 2, (2 << 34) // 2],
         )
-
-    def test_the_grid_is_one_core(self):
-        """One core until the grid is read from the iteration space."""
-        self.assertEqual(ktir.build_kernel_plan([make_op_spec()]).grid, (1,))
 
     def test_repeated_buffer_is_registered_once(self):
         specs = [make_op_spec()] + [make_op_spec()]
@@ -477,38 +693,195 @@ class TestInternalBufferSignal(unittest.TestCase):
 
 
 class TestRecipes(unittest.TestCase):
-    """One recipe per op, and every recipe is emittable by some family method."""
+    """One recipe per op, and every surface the plan can pick has an arm."""
 
     def test_every_recipe_is_complete(self):
         self.assertTrue(ktir.KtirBuilder.RECIPES)
         for op, recipe in ktir.KtirBuilder.RECIPES.items():
             with self.subTest(op=op):
                 self.assertGreaterEqual(recipe.arity, 1)
-                self.assertIsInstance(recipe.family, ktir.Family)
-                # A thunk, not the builder itself: resolving it here would need
-                # the dialect, which this module deliberately does not require.
-                self.assertTrue(callable(recipe.binding))
-                # The family it declares must be one the builder can emit,
-                # otherwise the walk fails at emit time rather than here.
-                self.assertTrue(
-                    callable(
-                        getattr(ktir.KtirBuilder, recipe.family.name.lower(), None)
-                    ),
-                    f"KtirBuilder has no {recipe.family.name.lower()}() for {op!r}",
-                )
+                self.assertTrue(recipe.arms)
+                # A reader, not the values: resolving one needs an ``op_info``.
+                self.assertTrue(recipe.attrs is None or callable(recipe.attrs))
+                for index, arm in enumerate(recipe.arms):
+                    with self.subTest(arm=index):
+                        self.assertIsInstance(arm.kind, ktir.BindingKind)
+                        # A thunk, not the builder itself: resolving it here would
+                        # need the dialect, which this module deliberately does
+                        # not require.
+                        self.assertTrue(callable(arm.binding))
+                # A one-armed op has to be reachable at every format, so that arm
+                # cannot list any: a lone arm claiming a format would make
+                # ``Recipe.arm`` refuse every other one.
+                if len(recipe.arms) == 1:
+                    self.assertEqual(recipe.arms[0].dtypes, ())
+
+        # Every kind is now registered by some arm, so the mirror assertion is
+        # worth making: PAYLOAD stopped being a hook nothing reaches when the
+        # ``spyreop`` intrinsics landed on it.
+        self.assertEqual(
+            {arm.kind for r in ktir.KtirBuilder.RECIPES.values() for arm in r.arms},
+            set(ktir.BindingKind),
+        )
+
+        # Which surface a step gets is the plan's choice, not a recipe's, so
+        # completeness on this side is about ``compute`` rather than about any one
+        # op: every ``Surface`` must appear as a ``case`` pattern.  Read off the
+        # AST because ``case _:`` alone turns a missing arm into a runtime
+        # discovery, at which point a module is already half built.
+        tree = ast.parse(inspect.getsource(ktir))
+        builder = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "KtirBuilder"
+        )
+        compute = next(
+            node
+            for node in builder.body
+            if isinstance(node, ast.FunctionDef) and node.name == "compute"
+        )
+        cased = {
+            node.pattern.value.attr
+            for node in ast.walk(compute)
+            if isinstance(node, ast.match_case)
+            and isinstance(node.pattern, ast.MatchValue)
+            and isinstance(node.pattern.value, ast.Attribute)
+        }
+        for surface in ktir.Surface:
+            self.assertIn(surface.name, cased, f"compute has no case for {surface}")
 
     def test_recipe_rejects_a_nonsense_arity(self):
         """A duplicate op name is ruff F601; arity is checked at construction."""
         with self.assertRaises(ValueError):
-            ktir.Recipe(arity=0, family=ktir.Family.ELEMENTWISE, binding=lambda: None)
+            ktir.Recipe(arity=0, arms=self._arm())
 
-    def test_family_comes_from_the_spec_not_the_name(self):
-        """The family is read from the spec rather than the op name, so one
-        binding can be wanted in more than one shape.  Only ELEMENTWISE has an
-        emission today, which is why a reducing spec is refused by the walk."""
-        spec = [make_op_spec()][0]
-        self.assertIs(ktir.Family.of(spec), ktir.Family.ELEMENTWISE)
-        self.assertEqual(list(ktir.Family), [ktir.Family.ELEMENTWISE])
+    def test_a_lone_arm_is_promoted_to_a_tuple(self):
+        """``arms=Arm(...)`` and ``arms=(Arm(...),)`` are the same recipe.
+
+        Asserted because the shorthand would otherwise be a second representation
+        of the field: anything reading ``recipe.arms`` directly must see a tuple
+        however the entry was written, or it iterates an ``Arm``'s attributes.
+        """
+        arm = self._arm()
+        self.assertEqual(ktir.Recipe(arity=1, arms=arm).arms, (arm,))
+        self.assertEqual(ktir.Recipe(arity=1, arms=(arm,)).arms, (arm,))
+        # And every registered entry has been normalised, whichever form it used.
+        for op, recipe in ktir.KtirBuilder.RECIPES.items():
+            with self.subTest(op=op):
+                self.assertIsInstance(recipe.arms, tuple)
+
+    @staticmethod
+    def _arm(*dtypes):
+        return ktir.Arm(
+            kind=ktir.BindingKind.NAMED, binding=lambda: None, dtypes=tuple(dtypes)
+        )
+
+    def test_recipe_rejects_an_ambiguous_arm_set(self):
+        """The two ways a format could resolve to more than one arm.
+
+        Both are refused where the table is written rather than at the lookup,
+        because a table that can be read two ways is wrong however it is read --
+        and ``Recipe.arm`` returning the first match would make which arm wins a
+        fact about declaration order.
+        """
+        with self.assertRaises(ValueError):
+            ktir.Recipe(arity=1, arms=())
+        with self.assertRaises(ValueError):
+            # Two arms claiming every unlisted format.
+            ktir.Recipe(arity=1, arms=(self._arm(), self._arm()))
+        with self.assertRaises(ValueError):
+            # Two arms claiming the same format.
+            ktir.Recipe(
+                arity=1,
+                arms=(
+                    self._arm(DataFormats.IEEE_INT32),
+                    self._arm(DataFormats.IEEE_INT32),
+                ),
+            )
+
+    def test_an_op_with_two_spellings_resolves_on_the_format(self):
+        """``add`` is a named linalg op at floats and a spyreop payload at int32.
+
+        The point of the arms: one entry per op, and the format picks the spelling.
+        Asserted on the recipe rather than through a plan so it holds without a
+        dialect build -- the bindings stay unresolved thunks.
+        """
+        recipe = ktir.KtirBuilder.RECIPES["add"]
+        self.assertIs(recipe.arm(DataFormats.SEN169_FP16).kind, ktir.BindingKind.NAMED)
+        self.assertIs(recipe.arm(DataFormats.IEEE_INT32).kind, ktir.BindingKind.PAYLOAD)
+        # Arity is the op's, not the arm's, so both spellings agree on it by
+        # construction rather than by two entries happening to match.
+        self.assertEqual(recipe.arity, 2)
+
+    def test_an_op_with_one_spelling_reaches_it_at_every_format(self):
+        """``sub`` has no integer intrinsic, so its one arm takes every format."""
+        recipe = ktir.KtirBuilder.RECIPES["sub"]
+        for dtype in (DataFormats.SEN169_FP16, DataFormats.IEEE_INT32, None):
+            with self.subTest(dtype=dtype):
+                self.assertIs(recipe.arm(dtype).kind, ktir.BindingKind.NAMED)
+
+    def test_the_format_reaches_the_step_and_picks_the_surface(self):
+        """An int32 ``add`` plans as a generic, and the step carries the format.
+
+        The whole path in one assertion: the spec's format picks the payload arm,
+        the payload arm picks ``Surface.GENERIC`` (a scalar builder needs a region),
+        and the format lands on the step so emission resolves the same arm without
+        seeing the spec.
+        """
+        spec = make_op_spec("add", dtype=DataFormats.IEEE_INT32)
+        [step] = ktir.build_kernel_plan([spec]).steps
+        self.assertIs(step.dtype, DataFormats.IEEE_INT32)
+        self.assertIs(step.surface, ktir.Surface.GENERIC)
+        # The same op at fp16 is the named linalg op, which states its own
+        # indexing and so needs no record.
+        [float_step] = ktir.build_kernel_plan([make_op_spec("add")]).steps
+        self.assertIs(float_step.surface, ktir.Surface.BARE)
+        self.assertIsNone(float_step.indexing)
+
+    def test_a_spec_that_mixes_formats_is_refused_by_the_plan(self):
+        """No arm resolves a mixed request, so the plan refuses to guess one.
+
+        Taking any single operand's format would emit an intrinsic for the wrong
+        type on the others, and the old ``any(... == INT32)`` rule did exactly that
+        for one int32 operand among floats.
+        """
+        spec = make_op_spec("add")
+        mixed = dataclasses.replace(
+            spec,
+            args=[
+                dataclasses.replace(spec.args[0], device_dtype=DataFormats.IEEE_INT32),
+                *spec.args[1:],
+            ],
+        )
+        with self.assertRaises(NotImplementedError) as ctx:
+            ktir.build_kernel_plan([mixed])
+        self.assertIn("mixes device formats", str(ctx.exception))
+
+    def test_a_format_no_arm_takes_is_refused(self):
+        """An op with only a claimed arm does not exist at any other format.
+
+        The membership question the two-table arrangement got wrong: an op is
+        supported at a format or it is not, and there is no second table to fall
+        back out of.
+        """
+        recipe = ktir.Recipe(arity=1, arms=(self._arm(DataFormats.IEEE_INT32),))
+        self.assertIs(recipe.arm(DataFormats.IEEE_INT32).kind, ktir.BindingKind.NAMED)
+        with self.assertRaises(NotImplementedError) as ctx:
+            recipe.arm(DataFormats.SEN169_FP16)
+        self.assertIn("no arm for", str(ctx.exception))
+
+    def test_a_reduction_asked_for_elementwise_is_rejected(self):
+        """The other direction of the agreement check, and the dangerous one.
+
+        ``sum``'s binding is a two-operand combiner; with nothing labelled as
+        reduced it would be handed a single operand and fail *inside* emission,
+        with a half-built module in hand.  Refused by the plan instead.
+        """
+        specs = [make_op_spec("sum", inputs=1, is_reduction=False)]
+        with self.assertRaises(NotImplementedError) as ctx:
+            ktir.build_kernel_plan(specs)
+        self.assertIn("registered as COMBINER", str(ctx.exception))
+        self.assertIn("elementwise", str(ctx.exception))
 
     def test_emit_asserts_on_an_unplanned_step(self):
         """The emitter's only remaining ``raise`` is this plan-bug guard.
@@ -520,6 +893,308 @@ class TestRecipes(unittest.TestCase):
         """
         with self.assertRaises(AssertionError):
             ktir.KtirBuilder.emit(None, [UnimplementedOp(op="atan2")])
+
+
+class TestReduceSurface(unittest.TestCase):
+    """Which of the two reduction shapes a loop nest can be emitted as.
+
+    ``linalg.reduce`` is the compact spelling: hand it the dimensions to fold
+    away and it works out the rest itself.  The price is that it can only say a
+    reduction that reads its input with one loop per input dimension and leaves
+    the surviving dimensions where they were.  Anything else has to be a
+    ``linalg.generic``, which spells the correspondence out in full.  These tests
+    go straight at that rule -- no spec is involved.
+    """
+
+    def test_a_plain_reduction_can_be_a_linalg_reduce(self):
+        """Fold away the middle dimension of three, keep the other two in order."""
+        self.assertIs(
+            ktir._reduce_surface(
+                ("parallel", "reduction", "parallel"), (0, 1, 2), (0, 2)
+            ),
+            ktir.Surface.REDUCE,
+        )
+
+    def test_a_reduction_over_the_stick_cannot_be_a_linalg_reduce(self):
+        """The on-stick sum, and the reason it is worth a test of its own.
+
+        Judged on its output alone, ``(1, 3)`` reads as "keep dimensions 1 and 3
+        of four, fold away 0 and 2" -- which ``linalg.reduce`` says perfectly
+        well.  What it cannot say is the input side: three input dimensions
+        addressed by a loop nest of four, because the 64 lanes are read as one
+        dimension and written as a different one.  ``linalg.reduce`` always reads
+        its input with exactly one loop per input dimension.
+
+        So if this rule is ever relaxed to look only at the output, this is the
+        test that fails -- and without it the emitter would quietly build a
+        two-dimensional ``linalg.reduce`` that sums the wrong elements.
+        """
+        iters = ("reduction", "parallel", "reduction", "parallel")
+        self.assertEqual(
+            tuple(d for d, it in enumerate(iters) if it == "reduction"), (0, 2)
+        )
+        self.assertIs(
+            ktir._reduce_surface(iters, (0, 1, 2), (1, 3)), ktir.Surface.GENERIC
+        )
+
+    def test_a_reduction_that_also_reorders_cannot_be_a_linalg_reduce(self):
+        """It folds dimensions away; it never moves the ones that survive.
+
+        Here the two survivors come out swapped, which the compact spelling has
+        no way to express.
+        """
+        self.assertIs(
+            ktir._reduce_surface(
+                ("parallel", "reduction", "parallel"), (0, 1, 2), (2, 0)
+            ),
+            ktir.Surface.GENERIC,
+        )
+
+
+class TestOnlyAReductionOutputIsSqueezed(unittest.TestCase):
+    """A pointwise op keeps a size-1 output dimension; only a reduction drops one.
+
+    Dropping a size-1 dimension is safe when a reduction left it behind, because
+    nothing was ever written along it.  It is not safe in general, and this spec
+    is the counterexample: an ``add`` whose operands and output all carry the
+    same size-1 dimension.  It compiles today, and it works precisely *because*
+    all three agree on it.  Drop it from the output alone and ``linalg.add``
+    would be handed a two-dimensional result against three-dimensional operands,
+    which fails when the module is verified -- inside emission, the one place
+    nothing is allowed to fail.
+
+    So the drop happens only for a reduction, and this test is the reason.
+    """
+
+    @staticmethod
+    def _size_one_add():
+        rows = sympy.Symbol("c1")
+        return [
+            make_op_spec(
+                size=[1, 256, 64],
+                coords=[sympy.Integer(0), rows, sympy.Mod(rows, 64)],
+            )
+        ]
+
+    def test_a_size_one_dimension_is_kept_when_nothing_is_reduced(self):
+        plan = ktir.build_kernel_plan(self._size_one_add())
+        [step] = plan.steps
+        self.assertIs(step.surface, ktir.Surface.BARE)
+        self.assertEqual(step.out.extent, (1, 256, 64))
+        for _buf_id, access in step.ins:
+            self.assertEqual(access.extent, (1, 256, 64))
+
+
+class TestAnOutputLaneIsNotATranspose(unittest.TestCase):
+    """A reduction may write an axis its input reduced; it may not reorder axes.
+
+    Both shapes reach the same matching walk, and before the broadcast lane had a
+    home the on-stick one came out of it with the *wrong* diagnostic: its output
+    lane matched no input axis, so it was reported as a permutation needing a
+    restickify.  It is not a permutation -- nothing moved -- so the two cases have
+    to be told apart, and a refusal that still fires for the real thing is what
+    says the first case was widened rather than the check being weakened.
+    """
+
+    def test_a_reduced_axis_may_be_written_again(self):
+        plan = ktir.build_kernel_plan(make_onstick_sum_specs())
+        [step] = plan.steps
+        self.assertEqual(step.out.extent, (256, 64))
+
+    def test_reordered_surviving_axes_are_still_refused(self):
+        """The same reduction with its two kept axes swapped on the way out."""
+        lanes, rows = sympy.symbols("c0 c1")
+        stick, lane = sympy.floor(lanes / 64), sympy.Mod(lanes, 64)
+        specs = [
+            make_op_spec(
+                "sum",
+                is_reduction=True,
+                inputs=1,
+                sizes=[[32, 256, 64], [64, 32]],
+                coords_per_arg=[[stick, rows, lane], [lane, stick]],
+                space={lanes: (2048, 1), rows: (256, 1)},
+            )
+        ]
+        with self.assertRaises(NotImplementedError) as ctx:
+            ktir.build_kernel_plan(specs)
+        self.assertIn("transpose", str(ctx.exception))
+
+
+class TestAPayloadWithNoNamedOpGetsAGeneric(unittest.TestCase):
+    """An elementwise op the dialect has no named op for, and how it is spelled.
+
+    ``sqrt`` is one: its binding is ``spyreop.sqrt``, a *scalar* builder, so there
+    is nothing to call it but a region and the step has to state the identity maps
+    itself.  Everything here is the plan's choice, made before any dialect is
+    reached, which is why these run without a dialect build.
+    """
+
+    def test_every_spyreop_intrinsic_is_a_payload(self):
+        """The kind is what puts them on the generic, so it is asserted per op.
+
+        Registered as PAYLOAD and not NAMED: a ``spyreop`` op is not a ``linalg``
+        named op, and calling one as if it were would hand a scalar builder tensor
+        operands inside emission.
+        """
+        for op in (
+            "exp",
+            "sqrt",
+            "sigmoid",
+            "reciprocal",
+            "gelufwd",
+            "softplus",
+        ):
+            with self.subTest(op=op):
+                recipe = ktir.KtirBuilder.RECIPES[op]
+                [arm] = recipe.arms
+                self.assertIs(arm.kind, ktir.BindingKind.PAYLOAD)
+                self.assertEqual(recipe.arity, 1)
+
+    def test_the_identity_maps_are_stated_rather_than_implied(self):
+        plan = ktir.build_kernel_plan([make_op_spec("sqrt", inputs=1)])
+        [step] = plan.steps
+        self.assertIs(step.surface, ktir.Surface.GENERIC)
+        self.assertEqual(step.reduce_dims, ())
+        # Rank 3, one map per input and then the result: the operand and the
+        # destination are read one element at a time in the same order.
+        self.assertEqual(step.indexing.iters, ("parallel",) * 3)
+        self.assertEqual(step.indexing.maps, ((0, 1, 2), (0, 1, 2)))
+
+    def test_a_scalar_argument_is_read_at_plan_time(self):
+        """softplus's two scalars land on the step, so emission derives nothing.
+
+        The values are on the record and the reader is not: what ``op_info`` looks
+        like is a fact about the request, and the step is what emission sees.
+        """
+        spec = make_op_spec(
+            "softplus",
+            inputs=1,
+            op_info={"constants": {"softplusBeta": 1.0, "softplusThresh": 20.0}},
+        )
+        [step] = ktir.build_kernel_plan([spec]).steps
+        self.assertEqual(step.attrs, (("beta", 1.0), ("threshold", 20.0)))
+
+    def test_an_op_with_no_scalar_arguments_carries_none(self):
+        """``attrs`` is empty for every op that is a function of its operands.
+
+        Asserted over every registered recipe rather than one, so an ``attrs``
+        reader added to an op that does not want one shows up here.
+        """
+        for op, recipe in ktir.KtirBuilder.RECIPES.items():
+            # A reduction wants coordinates that actually reduce, which its own
+            # fixtures own; the claim here is about the pointwise ops.
+            # ``arm(None)`` is the arm an unlisted format reaches, which is the one
+            # ``make_op_spec``'s fp16 args resolve to.
+            if (
+                recipe.attrs is not None
+                or recipe.arm(None).kind is ktir.BindingKind.COMBINER
+            ):
+                continue
+            with self.subTest(op=op):
+                spec = make_op_spec(op, inputs=recipe.arity)
+                [step] = ktir.build_kernel_plan([spec]).steps
+                self.assertEqual(step.attrs, ())
+
+    def test_a_missing_scalar_argument_is_the_plans_problem(self):
+        """An ``op_info`` without the constants fails in the plan, not in emission.
+
+        This is what reading the scalars at plan time buys: the failure arrives
+        before ``KtirBuilder.create``, so there is no half-built module in hand.
+        """
+        with self.assertRaises(KeyError):
+            ktir.build_kernel_plan([make_op_spec("softplus", inputs=1)])
+
+
+class TestStepFieldsAgreeWithTheSurface(unittest.TestCase):
+    """The price of two optional fields with one reader each, charged in one test.
+
+    ``indexing`` is carried by the surface that reads it and by no other, and a
+    nest with a reduced dim is never a bare named op.  Both are invariants of the
+    plan rather than of any one fixture, so they are asserted over every accepted
+    fixture in this file at once -- which is what stops the minimal record's
+    optional fields drifting into a bug nobody's own test covers.
+    """
+
+    @staticmethod
+    def _accepted_fixtures() -> dict:
+        """Every spec list in this file that ``build_kernel_plan`` accepts."""
+        n_stick, m = sympy.symbols("n_stick m")
+        nest, _spec, _loops = make_nested_op_spec(
+            levels=[(n_stick, 2), (m, 256)],
+            size=[1, 1, 64],
+            advances=[16384 * n_stick + 64 * m] * 3,
+        )
+        rows = sympy.Symbol("c1")
+        lanes = sympy.Symbol("c0")
+        stick, lane = sympy.floor(lanes / 64), sympy.Mod(lanes, 64)
+        return {
+            "pointwise": [make_op_spec()],
+            "divided": [make_op_spec(divisions={"d1": 32})],
+            "chained": make_chained_op_specs(("add", "mul")),
+            "nested": [nest],
+            "unit_axis_pointwise": [
+                make_op_spec(
+                    size=[1, 256, 64],
+                    coords=[sympy.Integer(0), rows, sympy.Mod(rows, 64)],
+                )
+            ],
+            "nonstick_reduction": [
+                make_op_spec(
+                    "sum",
+                    is_reduction=True,
+                    inputs=1,
+                    sizes=[[32, 256, 64], [1, 32, 64]],
+                    coords_per_arg=[
+                        [stick, rows, lane],
+                        [sympy.Integer(0), stick, lane],
+                    ],
+                    space={lanes: (2048, 32), rows: (256, 1)},
+                )
+            ],
+            "onstick_reduction": make_onstick_sum_specs(),
+            # A pointwise op whose payload is a ``spyreop`` intrinsic: the other
+            # way onto ``Surface.GENERIC``, and the one that reaches it with no
+            # reduced dim, which is the combination the two claims below split on.
+            "intrinsic": [make_op_spec("sqrt", inputs=1)],
+            "intrinsic_with_attrs": [
+                make_op_spec(
+                    "softplus",
+                    inputs=1,
+                    op_info={
+                        "constants": {"softplusBeta": 1.0, "softplusThresh": 20.0}
+                    },
+                )
+            ],
+        }
+
+    @staticmethod
+    def _steps(steps):
+        for step in steps:
+            if isinstance(step, ktir.LoopStep):
+                yield from TestStepFieldsAgreeWithTheSurface._steps(step.body)
+            else:
+                yield step
+
+    def test_the_fixtures_cover_every_surface(self):
+        """A vacuous invariant is the failure mode, so the coverage is asserted."""
+        surfaces = {
+            step.surface
+            for specs in self._accepted_fixtures().values()
+            for step in self._steps(ktir.build_kernel_plan(specs).steps)
+        }
+        self.assertEqual(surfaces, set(ktir.Surface))
+
+    def test_a_generic_is_the_only_step_that_states_its_indexing(self):
+        for name, specs in self._accepted_fixtures().items():
+            for position, step in enumerate(
+                self._steps(ktir.build_kernel_plan(specs).steps)
+            ):
+                with self.subTest(fixture=name, step=position):
+                    self.assertIs(
+                        step.indexing is not None, step.surface is ktir.Surface.GENERIC
+                    )
+                    if step.reduce_dims:
+                        self.assertIsNot(step.surface, ktir.Surface.BARE)
 
 
 def _tiled_reduction_specs() -> tuple:
@@ -611,24 +1286,16 @@ class TestLoopDerivations(unittest.TestCase):
         # Per view dim, the step each level takes: dim 0 <- n_stick, dim 1 <- m,
         # dim 2 <- nothing, i.e. the constant zero the kernel spells as %c0.
         self.assertEqual(a_access.index_coeffs, ((1, 0), (0, 1), (0, 0)))
+        # The fifth parameter is the buffer, and the element type comes off the
+        # arg -- asserted so that passing anything else there fails here rather
+        # than landing silently in the buffer slot.
+        self.assertIsNone(a_access.buffer)
+        self.assertEqual(a_access.elems, ktir.ElemTypes.of(a.device_dtype))
 
         c_layout, c_q = ktir._solve_layout(c, levels)
         c_access = ktir._access(c, c.device_size, c_q, c_layout)
         self.assertEqual(c_access.extent, (1, 64))
         self.assertEqual(c_access.index_coeffs, ((1, 0), (0, 0)))
-
-    def test_symbolic_view_extent_rejected(self):
-        """A symbolic device size would have to reach the kernel as an argument
-        and size a dynamic memref dim; neither exists yet.
-
-        Asserted at the derivation, not through the walk: a symbolic
-        ``device_size`` does not survive the pointwise alignment check's
-        ``int()`` either, so the walk reports the wrong thing about it.
-        """
-        arg = make_op_spec(size=[sympy.Symbol("s0"), 512, 64]).args[0]
-        with self.assertRaises(NotImplementedError) as ctx:
-            ktir._solve_layout(arg, [])
-        self.assertIn("is symbolic; a symbolic device size", str(ctx.exception))
 
     def test_untiled_access_sits_at_the_view_origin(self):
         """Depth zero is the general answer, not a special case."""
@@ -639,6 +1306,7 @@ class TestLoopDerivations(unittest.TestCase):
         access = ktir._access(arg, arg.device_size, q, layout)
         # One empty sum per dim: every index expression is zero.
         self.assertEqual(access.index_coeffs, ((), (), ()))
+        self.assertIsNone(access.buffer)
 
     def test_advance_no_dim_divides_is_reported(self):
         spec, loops = _tiled_reduction_specs()
@@ -652,6 +1320,281 @@ class TestLoopDerivations(unittest.TestCase):
         self.assertIn("not a whole number of steps", str(ctx.exception))
 
 
+_TABLE_DEFAULT = object()
+
+
+def fuse(specs, table=_TABLE_DEFAULT) -> tuple:
+    """``apply_plan_fusions``'s specs half, with the shipped table as default."""
+    if table is _TABLE_DEFAULT:
+        vector, _dropped = ktir.apply_plan_fusions(specs)
+    else:
+        vector, _dropped = ktir.apply_plan_fusions(specs, table)
+    return vector
+
+
+class FusionCase(unittest.TestCase):
+    """Base for the plan-fusion tests: one helper for the decline they share."""
+
+    def assertDeclined(self, specs, table=_TABLE_DEFAULT, reason=None):
+        """``specs`` came back unfused, in order, with nothing raised."""
+        if reason is None:
+            vector = fuse(specs, table)
+        else:
+            with self.assertLogs(ktir.logger, level="DEBUG") as captured:
+                vector = fuse(specs, table)
+            declines = [
+                record.getMessage()
+                for record in captured.records
+                if "declines" in record.getMessage()
+            ]
+            self.assertTrue(any(reason in message for message in declines), declines)
+        self.assertEqual([spec.op for spec in vector], [spec.op for spec in specs])
+        return vector
+
+
+class TestPlanFusionRewrite(FusionCase):
+    """Recognition and rewrite: what replaces a span the table names."""
+
+    def test_a_two_stage_span_the_table_names_becomes_one_stage(self):
+        """DECISION: recognise the span positionally and replace the whole of it.
+
+        With stages either side, because a match rewrites its own span and
+        nothing around it.
+        """
+        before, after = make_op_spec("add"), make_op_spec("mul")
+        vector = fuse([before, *make_absmax_pair(), after])
+        self.assertEqual([spec.op for spec in vector], ["add", "absmax", "mul"])
+        self.assertIs(vector[0], before)
+        self.assertIs(vector[2], after)
+        self.assertTrue(vector[1].is_reduction)
+        self.assertIn("absmax", ktir.KtirBuilder.RECIPES)
+
+    def test_a_span_the_pattern_does_not_name_is_left_alone(self):
+        """DECISION: a slot is ``(op name, is_reduction)``, matched adjacently."""
+        producer, consumer = make_absmax_pair()
+        cases = {
+            "another op": make_linked_op_specs(ops=("exp", "max")),
+            "not a reduction": make_linked_op_specs(reductions=(False, False)),
+            "a stage in between": [producer, make_op_spec("add"), consumer],
+        }
+        for label, specs in cases.items():
+            with self.subTest(case=label):
+                self.assertDeclined(specs)
+
+    def test_a_kernel_local_link_in_plain_hbm_is_fused(self):
+        """DECISION: locality, not a planner's placement, licenses the deletion.
+
+        The link is an ordinary HBM buffer the wrapper allocates and passes --
+        what the planners being off produces -- and it fuses because nothing
+        outside the kernel reads it.  This case used to be refused.
+        """
+        pair = make_absmax_pair(link={"hbm": None})
+        link = pair[0].args[-1]
+        self.assertFalse(ktir.is_internal(link))
+        self.assertTrue(link.kernel_local)
+        self.assertEqual([spec.op for spec in fuse(pair)], ["absmax"])
+
+    def test_the_fused_spec_keeps_the_survivors_access_and_the_sources_identity(self):
+        """DECISION: splice buffer IDENTITY across, never access geometry."""
+        pair = make_absmax_pair(in_sizes={1: [32, 256, 64]})
+        producer_in, producer_out = pair[0].args
+        survivor_read, survivor_out = pair[1].args
+
+        [fused] = fuse(pair)
+        read, out = fused.args
+
+        # Identity: the producer's own source, so the link is gone entirely.
+        self.assertEqual(read.name, producer_in.name)
+        self.assertEqual(read.arg_index, producer_in.arg_index)
+        self.assertEqual(read.allocation, producer_in.allocation)
+        self.assertEqual(read.device_dtype, producer_in.device_dtype)
+        self.assertNotEqual(read.name, producer_out.name)
+
+        # Access: the survivor's own, in the survivor's namespace and not the
+        # producer's.
+        self.assertEqual(read.device_size, survivor_read.device_size)
+        self.assertNotEqual(read.device_size, producer_in.device_size)
+        self.assertEqual(read.device_coordinates, survivor_read.device_coordinates)
+        self.assertEqual(out.device_coordinates, survivor_out.device_coordinates)
+        survivor_prefix = str(next(iter(pair[1].iteration_space)))[0]
+        symbols = {
+            str(symbol)
+            for coordinate in read.device_coordinates
+            for symbol in coordinate.free_symbols
+        }
+        self.assertTrue(symbols)
+        self.assertTrue(all(s.startswith(survivor_prefix) for s in symbols), symbols)
+        # And the survivor's iteration space, which is what ``_divisions`` reads.
+        self.assertEqual(fused.iteration_space, pair[1].iteration_space)
+
+
+class TestPlanFusionDeclines(FusionCase):
+    """Every condition the rewrite checks, and the vector it hands back."""
+
+    def test_a_producer_that_is_not_unary_is_not_deleted(self):
+        """DECISION: with two sources there is no single one to read instead."""
+        producer, survivor = make_absmax_pair()
+        source, link = producer.args
+        second = dataclasses.replace(source, name="x_other", arg_index=2)
+        producer = dataclasses.replace(producer, args=[source, second, link])
+        self.assertDeclined([producer, survivor], reason="is not unary")
+
+    @staticmethod
+    def _converting_producer() -> list:
+        """A pair whose producer writes its link at a different format."""
+        producer, survivor = make_absmax_pair()
+        source, link = producer.args
+        link = dataclasses.replace(link, device_dtype=DataFormats.IEEE_FP32)
+        return [dataclasses.replace(producer, args=[source, link]), survivor]
+
+    def test_a_producer_that_does_not_preserve_access_is_not_deleted(self):
+        """DECISION: the deleted producer must write where it read."""
+        d0, d1, d2 = sympy.symbols("d0 d1 d2")
+        cases = {
+            # An extent check sees this one...
+            "resizes": make_absmax_pair(out_sizes={0: [32, 256, 64]}),
+            # ...and only a coordinate check sees this one.
+            "moves elements": make_absmax_pair(out_coords={0: [d1, d0, d2]}),
+            # The rewrite hands the survivor the source's format, so a producer
+            # that converts is not a drop-in either.
+            "reformats": self._converting_producer(),
+        }
+        for label, pair in cases.items():
+            with self.subTest(case=label):
+                self.assertDeclined(pair, reason="not access-preserving")
+
+    def test_a_link_something_outside_the_kernel_reads_is_not_deleted(self):
+        """DECISION: only a kernel-local buffer may be deleted."""
+        self.assertDeclined(
+            make_absmax_pair(link_local=False), reason="is not kernel-local"
+        )
+
+    def test_a_link_read_more_than_once_is_not_deleted(self):
+        """DECISION: the link must be read exactly once, by the survivor."""
+        vector = self.assertDeclined(
+            make_linked_op_specs(
+                ops=("abs", "max", "sum", "add"),
+                reductions=(False, True, True, False),
+                edges=((0, 1), (0, 2), (1, 3), (2, 3)),
+            ),
+            reason="read 2 time(s)",
+        )
+        self.assertEqual([spec.op for spec in vector], ["abs", "max", "sum", "add"])
+
+    def test_the_viability_predicate_declines(self):
+        """DECISION: decline a form the device computes INCORRECTLY.
+
+        An undecidable question declines too, rather than raising.
+        """
+        fp16 = make_absmax_pair(onstick=True)
+        fp32 = make_absmax_pair(onstick=True, dtype=DataFormats.IEEE_FP32, lanes=32)
+        for pair in (fp16, fp32):
+            self.assertIs(ktir._reduction_surface(pair[1]), ktir.Surface.GENERIC)
+        # fp32 on-stick absmax compiles and returns garbage; fp16 is fine.
+        self.assertDeclined(fp32, reason="is not viable on this operand")
+        self.assertEqual([spec.op for spec in fuse(fp16)], ["absmax"])
+
+        def undecidable(fused):
+            raise NotImplementedError("no surface for this shape")
+
+        self.assertDeclined(
+            make_linked_op_specs(),
+            (make_plan_fusion(viable=undecidable),),
+            reason="no surface for this shape",
+        )
+
+
+class TestPlanFusionStructure(FusionCase):
+    """Where the fuser runs from, which is not observable anywhere else."""
+
+    def test_a_span_inside_a_loop_body_is_fused(self):
+        """DECISION: recurse into loop bodies."""
+        nest = LoopSpec(count=4, body=[LoopSpec(count=8, body=make_absmax_pair())])
+        [result] = fuse([nest])
+        self.assertEqual([spec.op for spec in result.body[0].body], ["absmax"])
+        # The rebuilt bodies are lists, which is what ``LoopSpec.body`` declares.
+        self.assertIsInstance(result.body, list)
+        self.assertIsInstance(result.body[0].body, list)
+
+    def test_a_divided_pair_plans_because_fusion_precedes_the_grid(self):
+        """DECISION: fuse on the first line of ``add_specs``, before the grid."""
+        pair = make_absmax_pair(row_division=32)
+        with self.assertRaises(NotImplementedError) as ctx:
+            ktir._divisions(pair)
+        self.assertIn("different work divisions", str(ctx.exception))
+
+        plan = ktir.build_kernel_plan(pair)
+        self.assertEqual(plan.grid, (32,))
+        self.assertEqual(plan.divisions, (ktir.Division(symbol="e1", div=32, inner=1),))
+        self.assertEqual([step.op for step in plan.steps], ["absmax"])
+
+
+class TestPlanFusionDroppedBuffer(FusionCase):
+    """REGRESSION: a fused-away link that is a real kernel argument.
+
+    With the planners off, the link is a plain HBM buffer the wrapper still
+    allocates and passes; deleting its producer must not shift the positional
+    binding of every argument after it (issue: wrong answer on device).
+    """
+
+    def test_a_dropped_link_still_reserves_its_argument_slot(self):
+        pair = make_absmax_pair(link={"hbm": None})
+        link = pair[0].args[-1]
+        self.assertGreaterEqual(link.arg_index, 0)
+        # The pre-fusion count: one arg_index per distinct buf_id, first seen.
+        pre_fusion: dict[str, int] = {}
+        for spec in pair:
+            for arg in spec.args:
+                if arg.arg_index >= 0:
+                    pre_fusion.setdefault(ktir.buf_id(arg), arg.arg_index)
+
+        plan = ktir.build_kernel_plan(pair)
+        self.assertEqual(len(plan.parameters), len(pre_fusion))
+        self.assertIn(link.arg_index, [buffer.arg_index for buffer in plan.parameters])
+
+    def test_the_dropped_buffer_is_recorded_but_never_accessed(self):
+        pair = make_absmax_pair(link={"hbm": None})
+        link_id = ktir.buf_id(pair[0].args[-1])
+
+        plan = ktir.build_kernel_plan(pair)
+        self.assertIn(link_id, plan.dropped)
+        for step in plan.steps:
+            self.assertNotEqual(step.out_buf_id, link_id)
+            self.assertNotIn(link_id, [read_id for read_id, _ in step.ins])
+        # And it carries no shape, so anything that tried to view it would fail
+        # rather than emit a view over the wrong extent.
+        self.assertEqual(plan.buffers[link_id].layout.extent, ())
+
+
+class TestGenuineAbsmaxRecipe(unittest.TestCase):
+    """``RECIPES['absmax']`` has a caller that is not the fusion table."""
+
+    def test_a_standalone_absmax_reduction_plans_without_any_fusion(self):
+        rows, reduced = sympy.symbols("c0 c1")
+        stick, lane = sympy.floor(reduced / 64), sympy.Mod(reduced, 64)
+        spec = make_op_spec(
+            "absmax",
+            is_reduction=True,
+            inputs=1,
+            sizes=[[2, 256, 64], [1, 256, 64]],
+            coords_per_arg=[
+                [stick, rows, lane],
+                [sympy.Integer(0), rows, sympy.Integer(0)],
+            ],
+            space={rows: (256, 1), reduced: (128, 1)},
+        )
+        self.assertIn("absmax", ktir.KtirBuilder.RECIPES)
+        plan = ktir.build_kernel_plan([spec])
+        [step] = plan.steps
+        self.assertEqual(step.op, "absmax")
+        # A reduction's recipe must accumulate, and on-stick is the generic form.
+        self.assertIs(
+            ktir.KtirBuilder.RECIPES["absmax"].arm(FP16).kind,
+            ktir.BindingKind.COMBINER,
+        )
+        self.assertIs(step.surface, ktir.Surface.GENERIC)
+
+
 # ---------------------------------------------------------------------------
 # What we generate
 # ---------------------------------------------------------------------------
@@ -662,7 +1605,7 @@ class TestRefusals(unittest.TestCase):
 
     A label is a token shared by the raise and this test, so grepping it finds
     both.  No message here claims a consumer is the blocker: this repository
-    cannot run dbo-opt or the scheduler, so what they accept is not observable
+    cannot run the backend compiler or the scheduler, so what they accept is not observable
     from these tests, and two labels that used to claim it were both wrong.
     """
 
@@ -703,7 +1646,7 @@ class TestRefusals(unittest.TestCase):
         """A refusal says what is missing here, not what someone else rejects.
 
         Checked over the ``_unimplemented`` messages rather than the whole file:
-        naming dbo-opt is legitimate where it explains why an *option* exists
+        naming the backend is legitimate where it explains why an *option* exists
         (baking addresses), but not as the reason a capability is refused, which
         this repository cannot observe.
         """
@@ -849,14 +1792,7 @@ class TestEmissionCannotRefuse(unittest.TestCase):
         }
 
         seen: set[str] = set()
-        # ``compute`` reaches a family's method by name (``Family.ELEMENTWISE`` ->
-        # ``elementwise``), which no call-graph walk can follow, so every family
-        # method is a root here: a new family cannot escape this check by being
-        # dispatched dynamically.
-        families = [family.name.lower() for family in ktir.Family]
-        for family in families:
-            self.assertIn(family, methods, f"KtirBuilder has no {family}()")
-        pending = ["emit", *families]
+        pending = ["emit"]
         raised: list[tuple[str, str]] = []
         while pending:
             name = pending.pop()
