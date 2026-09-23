@@ -195,9 +195,7 @@ class TestSpyreProfiler(TestCase):
 
         self.assertTrue(
             pairs,
-            "No correlated CPU-launch ↔ kernel pairs found in the trace. "
-            "Ensure ProfilerActivity.PrivateUse1 is enabled and "
-            "torch.spyre.synchronize() was called inside the profiled region.",
+            "No correlated privateuse1_runtime ↔ kernel pairs found in the trace.",
         )
 
         if shifted:
