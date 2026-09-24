@@ -83,6 +83,8 @@ from for_each_tile_fixtures import (
     batched_online_softmax_fn,
     nested_add_outer_row_inner_col_fn,
     nested_add_outer_row_inner_col_reference,
+    nested_online_softmax_fn,
+    nested_online_softmax_reference,
     nested_split_m_then_k_fn,
     nested_split_m_then_k_reference,
     online_softmax_fn,
@@ -92,6 +94,8 @@ from for_each_tile_fixtures import (
     paged_gather_kv_fn,
     paged_gather_kv_inputs,
     paged_gather_kv_reference,
+    paged_gather_nested_fn,
+    paged_gather_nested_reference,
     paged_gather_reference,
     softmax_row_tiled_fn,
     softmax_row_tiled_reference,
@@ -693,6 +697,169 @@ class TestForEachTileNestedCarryE2E(_DynamoResetTestCase):
         torch.testing.assert_close(
             out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
         )
+
+    def test_nested_online_softmax(self):
+        """Map-outer/carry-inner nesting with a multi-leaf carry.
+
+        nested_online_softmax_fn maps Q-row-tiles around online_softmax_fn's
+        own 3-leaf (m, denom, acc) carry over K/V tiles -- unlike
+        test_batched_map_over_online_softmax_carry (which stages full K/V
+        buffers in the outer loop and tiles Lk in the inner one), this
+        fixture re-runs the ENTIRE online-softmax recurrence, including its
+        own K/V tiling, once per outer Q-tile: the nesting wraps a full
+        inner for_each_tile call rather than sharing one carry-tiling level
+        across both loops.
+        """
+        Q = cached_xavier((LQ, D))
+        K = cached_xavier((LK, D), differentiation=1)
+        V = cached_xavier((LK, D), differentiation=2)
+        ref = nested_online_softmax_reference(
+            dl16_round(Q.float()), dl16_round(K.float()), dl16_round(V.float())
+        )
+
+        compiled = torch.compile(
+            nested_online_softmax_fn, backend="inductor", fullgraph=True
+        )
+        out = compiled(Q.to(DEVICE_NAME), K.to(DEVICE_NAME), V.to(DEVICE_NAME))
+
+        torch.testing.assert_close(
+            out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
+
+
+class TestForEachTileNestedGatherE2E(_DynamoResetTestCase):
+    """Kind.GATHER nested inside another for_each_tile level.
+
+    paged_gather_fn/paged_gather_kv_fn (TestForEachTileE2E) exercise
+    Kind.GATHER but only as a single loop level. paged_gather_nested_fn
+    wraps an outer map over Q-row-tiles around that same gather-mode body
+    (tiled block table, invariant page pool, one page gathered per trip),
+    the shape paged attention would want with an outer query tile.
+    """
+
+    ATOL = 1e-2
+    RTOL = 1e-2
+
+    def test_gather_mode_nested_paged_pages(self):
+        _, table, _ = paged_gather_inputs()
+        pages = cached_xavier((PAGE_POOL, PAGE_SIZE, PAGE_HS))
+        q = cached_xavier((PAGE_LQ, PAGE_HS), differentiation=1)
+        ref = paged_gather_nested_reference(
+            dl16_round(pages.float()), dl16_round(q.float())
+        )
+
+        compiled = torch.compile(
+            paged_gather_nested_fn, backend="inductor", fullgraph=True
+        )
+        out = compiled(pages.to(DEVICE_NAME), table.to(DEVICE_NAME), q.to(DEVICE_NAME))
+
+        torch.testing.assert_close(
+            out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
+
+
+# --- trip-range vector gather (loop-trip ranges reach coordinate queries) -----
+
+TRIP_POOL, TRIP_E, TRIP_SIZE, TRIP_HS, TRIP_LQ = 64, 4, 32, 64, 32
+
+
+def trip_range_build(trips, e):
+    pages = (
+        torch.pow(torch.tensor(2.0), (torch.arange(TRIP_POOL) % 8).float()) / 64.0
+    ).to(torch.float16)
+    pages = (
+        pages.reshape(TRIP_POOL, 1, 1)
+        .expand(TRIP_POOL, TRIP_SIZE, TRIP_HS)
+        .contiguous()
+    )
+    q = torch.full((TRIP_LQ, TRIP_HS), 1.0 / 64.0, dtype=torch.float16)
+    table = torch.zeros(trips, 32, dtype=torch.int32)
+    for t in range(trips):
+        for j in range(e):
+            table[t, j] = (t * e + j) % TRIP_POOL
+    return pages, table, q
+
+
+def trip_range_ref(pages, q, ids):
+    pf, qf = pages.float(), q.float()
+    acc = torch.zeros(TRIP_LQ, TRIP_HS)
+    for p in ids:
+        page = pf[int(p)]
+        acc = acc + (qf @ page.T) @ page
+    return acc
+
+
+def trip_range_fn(e):
+    from torch_spyre._inductor.wsr import for_each_tile
+
+    def fn(pages, table, q):
+        def body(acc, tiles):
+            table_row, pages_all, q_whole = tiles
+            idx = table_row[0, 0:e]
+            pages_v = pages_all.index_select(0, idx)
+            scores = torch.matmul(q_whole.unsqueeze(0), pages_v.transpose(-2, -1))
+            out = torch.matmul(scores, pages_v)
+            return acc + out.sum(0), None
+
+        acc0 = torch.zeros(TRIP_LQ, TRIP_HS, dtype=q.dtype, device=q.device)
+        final, _ = for_each_tile(
+            body, (table, pages, q), dims=(0, None, None), tile_size=1, init=acc0
+        )
+        return final
+
+    return fn
+
+
+class TestForEachTileTripRangesE2E(_DynamoResetTestCase):
+    """A VECTOR page gather per trip (vs paged_gather_fn's point read).
+
+    On the base this fails at trips >= 2 with ``indirect symbol u0 not found in
+    indirect_sizes``; with the fix it passes and the output is neither the first
+    group repeated nor the advance applied twice.
+    """
+
+    ATOL = 1e-3
+    RTOL = 1e-3
+
+    def test_multi_trip_vector_page_gather(self):
+        e = TRIP_E
+        for trips in (1, 2, 4):
+            with self.subTest(trips=trips):
+                # Reset per case: without it Dynamo generalizes the fixed trip
+                # counts across subtests and the for_each_tile splice is skipped.
+                torch._dynamo.reset()
+                pages, table, q = trip_range_build(trips, e)
+                ids = [int(table[t, j]) for t in range(trips) for j in range(e)]
+                want = trip_range_ref(pages, q, ids)
+                compiled = torch.compile(
+                    trip_range_fn(e), backend="inductor", fullgraph=True
+                )
+                out = (
+                    compiled(
+                        pages.to(DEVICE_NAME), table.to(DEVICE_NAME), q.to(DEVICE_NAME)
+                    )
+                    .cpu()
+                    .float()
+                )
+                assert torch.isfinite(out).all()
+                torch.testing.assert_close(out, want, atol=self.ATOL, rtol=self.RTOL)
+                if trips >= 2:
+                    rep_first = trip_range_ref(
+                        pages,
+                        q,
+                        [int(table[0, j]) for _ in range(trips) for j in range(e)],
+                    )
+                    adv_twice = trip_range_ref(
+                        pages,
+                        q,
+                        [
+                            int(table[(2 * t) % trips, j])
+                            for t in range(trips)
+                            for j in range(e)
+                        ],
+                    )
+                    assert (out - rep_first).abs().max().item() > 1e-2
+                    assert (out - adv_twice).abs().max().item() > 1e-2
 
 
 if __name__ == "__main__":
