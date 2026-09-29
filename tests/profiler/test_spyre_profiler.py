@@ -47,6 +47,65 @@ class _ProfilerMLP(torch.nn.Module):
         return self.fc2(torch.relu(self.fc1(x)))
 
 
+def _find_shifted_kernel_timestamps(events):
+    """Return correlated (cpu_launch, kernel) pairs and those where kernel.ts < cpu_launch.ts.
+
+    A kernel is "shifted" when its hardware start timestamp is earlier than
+    the CPU dispatch event that launched it, indicating the Spyre hardware
+    clock and the host clock are not correctly correlated.
+
+    CPU launch events have ``cat == "privateuse1_runtime"`` and carry an
+    ``args["correlation"]`` integer that matches the ``args["correlation"]``
+    on the corresponding ``cat == "kernel"`` event.
+
+    Only complete events (``ph == "X"``) with a finite numeric ``ts`` are
+    considered. Events missing ``args`` or a ``correlation`` key are silently
+    skipped; the caller asserts that at least one correlated pair was found.
+
+    Returns:
+        pairs: list of (cpu_event, kernel_event) dicts for every correlated pair
+        shifted: subset of pairs where kernel_event["ts"] < cpu_event["ts"]
+    """
+    cpu_ev_by_corr: dict[int, dict] = {}
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        if ev.get("ph") != "X" or ev.get("cat") != "privateuse1_runtime":
+            continue
+        ts = ev.get("ts")
+        if not (
+            isinstance(ts, (int, float))
+            and not isinstance(ts, bool)
+            and math.isfinite(ts)
+        ):
+            continue
+        corr = ev.get("args", {}).get("correlation")
+        if corr is None:
+            continue
+        cpu_ev_by_corr[int(corr)] = ev
+
+    pairs = []
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        if ev.get("ph") != "X" or ev.get("cat") != "kernel":
+            continue
+        ts = ev.get("ts")
+        if not (
+            isinstance(ts, (int, float))
+            and not isinstance(ts, bool)
+            and math.isfinite(ts)
+        ):
+            continue
+        corr = ev.get("args", {}).get("correlation")
+        if corr is None or int(corr) not in cpu_ev_by_corr:
+            continue
+        pairs.append((cpu_ev_by_corr[int(corr)], ev))
+
+    shifted = [(cpu_ev, k_ev) for cpu_ev, k_ev in pairs if k_ev["ts"] < cpu_ev["ts"]]
+    return pairs, shifted
+
+
 class TestSpyreProfiler(TestCase):
     @unittest.skipUnless(Test_spyre, "requires spyre device")
     @skipIfTorchDynamo("profiler gets ignored if dynamo activated")
@@ -1162,62 +1221,3 @@ def test_kernel_time_overlap(tmp_path):
             f"{len(overlaps)} Spyre device overlap(s) detected:\n"
             + "\n".join(overlap_details)
         )
-
-
-def _find_shifted_kernel_timestamps(events):
-    """Return correlated (cpu_launch, kernel) pairs and those where kernel.ts < cpu_launch.ts.
-
-    A kernel is "shifted" when its hardware start timestamp is earlier than
-    the CPU dispatch event that launched it, indicating the Spyre hardware
-    clock and the host clock are not correctly correlated.
-
-    CPU launch events have ``cat == "privateuse1_runtime"`` and carry an
-    ``args["correlation"]`` integer that matches the ``args["correlation"]``
-    on the corresponding ``cat == "kernel"`` event.
-
-    Only complete events (``ph == "X"``) with a finite numeric ``ts`` are
-    considered. Events missing ``args`` or a ``correlation`` key are silently
-    skipped; the caller asserts that at least one correlated pair was found.
-
-    Returns:
-        pairs: list of (cpu_event, kernel_event) dicts for every correlated pair
-        shifted: subset of pairs where kernel_event["ts"] < cpu_event["ts"]
-    """
-    cpu_ev_by_corr: dict[int, dict] = {}
-    for ev in events:
-        if not isinstance(ev, dict):
-            continue
-        if ev.get("ph") != "X" or ev.get("cat") != "privateuse1_runtime":
-            continue
-        ts = ev.get("ts")
-        if not (
-            isinstance(ts, (int, float))
-            and not isinstance(ts, bool)
-            and math.isfinite(ts)
-        ):
-            continue
-        corr = ev.get("args", {}).get("correlation")
-        if corr is None:
-            continue
-        cpu_ev_by_corr[int(corr)] = ev
-
-    pairs = []
-    for ev in events:
-        if not isinstance(ev, dict):
-            continue
-        if ev.get("ph") != "X" or ev.get("cat") != "kernel":
-            continue
-        ts = ev.get("ts")
-        if not (
-            isinstance(ts, (int, float))
-            and not isinstance(ts, bool)
-            and math.isfinite(ts)
-        ):
-            continue
-        corr = ev.get("args", {}).get("correlation")
-        if corr is None or int(corr) not in cpu_ev_by_corr:
-            continue
-        pairs.append((cpu_ev_by_corr[int(corr)], ev))
-
-    shifted = [(cpu_ev, k_ev) for cpu_ev, k_ev in pairs if k_ev["ts"] < cpu_ev["ts"]]
-    return pairs, shifted
