@@ -48,15 +48,16 @@ class _ProfilerMLP(torch.nn.Module):
 
 
 def _find_shifted_kernel_timestamps(events):
-    """Return correlated (cpu_launch, kernel) pairs and those where kernel.ts < cpu_launch.ts.
+    """Return correlated (aiuLaunchControlBlocks, kernel) pairs and those where kernel.ts < cpu_launch.ts.
 
     A kernel is "shifted" when its hardware start timestamp is earlier than
-    the CPU dispatch event that launched it, indicating the Spyre hardware
-    clock and the host clock are not correctly correlated.
+    the ``aiuLaunchControlBlocks`` CPU dispatch event that launched it,
+    indicating the Spyre hardware clock and the host clock are not correctly
+    correlated.
 
-    CPU launch events have ``cat == "privateuse1_runtime"`` and carry an
-    ``args["correlation"]`` integer that matches the ``args["correlation"]``
-    on the corresponding ``cat == "kernel"`` event.
+    ``aiuLaunchControlBlocks`` events have ``cat == "privateuse1_runtime"``
+    and carry an ``args["correlation"]`` integer that matches the
+    ``args["correlation"]`` on the corresponding ``cat == "kernel"`` event.
 
     Only complete events (``ph == "X"``) with a finite numeric ``ts`` are
     considered. Events missing ``args`` or a ``correlation`` key are silently
@@ -70,7 +71,11 @@ def _find_shifted_kernel_timestamps(events):
     for ev in events:
         if not isinstance(ev, dict):
             continue
-        if ev.get("ph") != "X" or ev.get("cat") != "privateuse1_runtime":
+        if (
+            ev.get("ph") != "X"
+            or ev.get("cat") != "privateuse1_runtime"
+            or ev.get("name") != "aiuLaunchControlBlocks"
+        ):
             continue
         ts = ev.get("ts")
         if not (
@@ -254,7 +259,7 @@ class TestSpyreProfiler(TestCase):
 
         self.assertTrue(
             pairs,
-            "No correlated privateuse1_runtime ↔ kernel pairs found in the trace.",
+            "No correlated aiuLaunchControlBlocks ↔ kernel pairs found in the trace.",
         )
 
         if shifted:
