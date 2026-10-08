@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from torch.fx import Node
 from torch.fx.graph import Graph
 from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
@@ -25,12 +26,14 @@ from torch_spyre._inductor.pass_utils import (
     iteration_space_from_op,
     invalidate_op_read_writes,
     op_read_writes,
+    register_operation_after_graph_edit,
 )
 from torch._inductor.virtualized import V
 from torch._inductor.ir import (
     ComputedBuffer,
     TensorBox,
     StorageBox,
+    ReinterpretView,
     Buffer,
     Operation,
     Pointwise,
@@ -39,7 +42,7 @@ from torch._inductor.ir import (
 from torch._inductor.lowering import clone as clone_lowering, lowerings
 
 from torch_spyre._inductor.ir import FixedTiledLayout
-from torch_spyre._inductor.split_multi_ops import _origin_in_graph
+from torch_spyre._inductor.pass_utils import origin_in_graph
 
 
 class GraphEditor:
@@ -63,7 +66,7 @@ class GraphEditor:
 
     def _replace_matching_buffer(
         self,
-        buffer: TensorBox | StorageBox | Buffer,
+        buffer: TensorBox | StorageBox | ReinterpretView | Buffer,
         old_name: str,
         i: int,
         new: ComputedBuffer | TensorBox,
@@ -71,13 +74,22 @@ class GraphEditor:
         """If `buffer`'s name matches `old_name`, then replace it with `new` and return True;
         otherwise, do nothing and return False.
 
-        If `buffer` is a `TensorBox` (containing a `StorageBox`) or `StorageBox`, wrap `new` up in
-        the same way. If `new` is a `TensorBox` itself, it is assumed to be wrapped up in an
-        appropriate way."""
+        If `buffer` is a `TensorBox` (containing a `StorageBox`) or
+        `StorageBox`, wrap `new` up in the same way. Preserve a
+        `ReinterpretView` and replace only its underlying storage so that its
+        shape, strides, and offset remain intact. If `new` is a `TensorBox`
+        itself, it is assumed to be wrapped up in an appropriate way."""
         fs = []
+        last_reinterpret_view = None
         while not isinstance(buffer, Buffer):
             if isinstance(buffer, TensorBox):
                 fs.append(TensorBox)
+            elif isinstance(buffer, ReinterpretView):
+                # Keep a graph output's view metadata (shape, strides, and
+                # offset) and replace only the storage it references.  A
+                # trailing view commonly wraps SDPA outputs lowered from
+                # non-contiguous inputs.
+                last_reinterpret_view = buffer
             else:
                 assert isinstance(buffer, StorageBox), (
                     f"unexpected buffer type {type(buffer)} while replacing '{old_name}' ({buffer})"
@@ -86,10 +98,14 @@ class GraphEditor:
             buffer = buffer.data
 
         if buffer.name == old_name:
-            if not isinstance(new, TensorBox):
+            if last_reinterpret_view is not None and not isinstance(new, TensorBox):
+                object.__setattr__(last_reinterpret_view, "data", StorageBox(new))
+            elif not isinstance(new, TensorBox):
                 for f in fs[::-1]:
                     new = f(new)
-            self.lowering.graph_outputs[i] = new
+                self.lowering.graph_outputs[i] = new
+            else:
+                self.lowering.graph_outputs[i] = new
             return True
         else:
             return False
@@ -112,8 +128,30 @@ class GraphEditor:
         input: bool,
         private: bool = False,
         lx_view: PerCoreView | None = None,
+        after_fx: Node | None = None,
+        lower_anchor: Operation | None = None,
+        lower_before: Operation | None = None,
     ) -> ComputedBuffer:
-        """Insert a clone; private clones rewire only ``buffer_users``."""
+        """Insert a clone; private clones rewire only ``buffer_users``.
+
+        ``after_fx`` and ``lower_anchor`` relocate the clone to run after
+        ``lower_anchor`` in the lowered operation order (and after ``after_fx``
+        in the FX graph) instead of after the producer.  They exist for the
+        post-loop drain of a resident loop carry, whose value only becomes
+        final after the whole counted loop: the drain must be inserted after the
+        loop's last member, not after the pre-loop initializer.  Both default
+        to ``None``, which keeps every existing caller byte-identical.
+
+        ``lower_before`` is the mirror image for an input clone: it places the
+        lowered clone immediately before ``lower_before`` (the entry of the
+        counted loop its consumers run in) instead of before its first
+        consumer, so a loop-invariant copy runs once rather than every trip.
+        The FX node already sits right after the input placeholder, so only the
+        lowered order moves.
+        """
+        assert lower_anchor is None or lower_before is None, (
+            "a clone has one position: lower_anchor and lower_before exclude each other"
+        )
         if input and lx_view is None:
             raise ValueError("an LX input clone requires its accepted physical view")
         if isinstance(buffer, TensorBox):
@@ -129,8 +167,8 @@ class GraphEditor:
         # and the subgraph's own compute node. inserting_after requires an anchor
         # in the current lowering graph, so select the graph-local origin rather
         # than list(origins)[0] (which may be a foreign parent-graph node and
-        # asserts). See split_multi_ops._origin_in_graph for the same pattern.
-        buf_fx = _origin_in_graph(buffer.origins, self.fx_graph)
+        # asserts). See pass_utils.origin_in_graph for the same pattern.
+        buf_fx = origin_in_graph(buffer.origins, self.fx_graph)
         assert buf_fx is not None, (
             f"no origin of {buf_name} lives in the current lowering graph; "
             f"origins={[getattr(n, 'name', n) for n in buffer.origins]}"
@@ -139,7 +177,7 @@ class GraphEditor:
         if private:
             anchors = []
             for consumer in buffer_users:
-                anchor = getattr(consumer, "origin_node", None) or _origin_in_graph(
+                anchor = getattr(consumer, "origin_node", None) or origin_in_graph(
                     consumer.origins, self.fx_graph
                 )
                 assert anchor is not None, (
@@ -150,7 +188,16 @@ class GraphEditor:
                 )
                 anchors.append(anchor)
             old_users = list(dict.fromkeys(anchors))
-        self.fx_graph.inserting_after(buf_fx)
+        if after_fx is not None:
+            # Post-loop drain: place the FX clone after the whole-loop anchor
+            # (the retained while_loop HOP node) while still reading only
+            # ``buf_fx``, so the loop's carried input is untouched and no cycle
+            # is possible.  The anchor must live in this lowering's graph; the
+            # allocator's plan already re-checked that before committing.
+            assert after_fx.graph is self.fx_graph, (
+                f"FX drain anchor {after_fx} is not in the current lowering graph"
+            )
+        self.fx_graph.inserting_after(after_fx if after_fx is not None else buf_fx)
         new_fx_node = self.fx_graph.create_node(
             "call_function", self.clone_aten_op, (buf_fx,)
         )
@@ -183,7 +230,7 @@ class GraphEditor:
         new_com_buf.origin_node = new_fx_node
         copy_op_metadata(metadata_source, new_com_buf)
         new_com_buf.name = self.lowering.register_buffer(new_com_buf)
-        self.lowering.register_operation(new_com_buf)
+        register_operation_after_graph_edit(self.lowering, new_com_buf)
         new_buf_name = new_com_buf.get_name()
 
         # Clone loops mirror their source/consumer symbols before Scheduler.
@@ -253,9 +300,21 @@ class GraphEditor:
                     )
 
         self.lowering.operations.remove(new_com_buf)
-        self.lowering.operations.insert(
-            self.lowering.operations.index(buffer_users[0]), new_com_buf
-        )
+        if lower_anchor is not None:
+            # Post-loop drain: insert after the loop's last member (an
+            # Operation object, not a saved index -- earlier clones in the same
+            # push only insert before/after existing ops, so the identity
+            # survives and a stale index cannot).
+            self.lowering.operations.insert(
+                self.lowering.operations.index(lower_anchor) + 1, new_com_buf
+            )
+        else:
+            # A hoisted input clone goes before its consumers' loop entry; any
+            # other clone goes before its first consumer, as before.
+            before = lower_before if lower_before is not None else buffer_users[0]
+            self.lowering.operations.insert(
+                self.lowering.operations.index(before), new_com_buf
+            )
 
         return new_com_buf
 

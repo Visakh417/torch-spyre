@@ -147,8 +147,8 @@ int SpyreStream::priority() const {
 bool SpyreStream::query() const {
   c10::DeviceGuard guard(stream_.device());
 
-  DEBUGINFO("SpyreStream::query() - stream ", id(), " on device ",
-            static_cast<int>(device().index()));
+  SPYRE_RUNTIME_DEBUG() << "stream " << id() << " on device "
+                        << static_cast<int>(device().index());
 
   flex::RuntimeStream* handle = resolveRuntimeHandle();
   return handle->query();
@@ -158,8 +158,8 @@ void SpyreStream::synchronize() const {
   RECORD_FUNCTION("host::synchronize", {});
   c10::DeviceGuard device_guard(stream_.device());
 
-  DEBUGINFO("SpyreStream::synchronize() - stream ", id(), " on device ",
-            static_cast<int>(device().index()));
+  SPYRE_RUNTIME_DEBUG() << "stream " << id() << " on device "
+                        << static_cast<int>(device().index());
 
   resolveRuntimeHandle()->synchronize();
 }
@@ -172,13 +172,16 @@ void SpyreStream::copyProgramAsync(
     void* prog_cpu_ptr, const flex::CompositeAddress* device_address) const {
   // NOTE: the assumption is that the size of the program match the size of
   // device_address
-  copyAsyncImpl(prog_cpu_ptr, device_address, nullptr, true);
+  copyAsyncImpl(prog_cpu_ptr, /*cpu_storage_bytes=*/0, device_address, nullptr,
+                /*host2device=*/true);
 }
 
 void SpyreStream::copyAsync(const at::Tensor& src,
                             const at::Tensor& dst) const {
-  DEBUGINFO("src (", src.scalar_type(), ") is on:", src.device());
-  DEBUGINFO("dst (", dst.scalar_type(), ") on:", dst.device());
+  SPYRE_RUNTIME_DEBUG() << "src (" << src.scalar_type()
+                        << ") is on:" << src.device();
+  SPYRE_RUNTIME_DEBUG() << "dst (" << dst.scalar_type()
+                        << ") on:" << dst.device();
 
   // Determine copy direction
   bool host2device = src.is_cpu() && dst.is_privateuseone();
@@ -190,15 +193,16 @@ void SpyreStream::copyAsync(const at::Tensor& src,
   if (host2device || device2host) {
     // Host-to-device or device-to-host copy
     void* cpu_ptr = const_cast<void*>(cpu_tensor->storage().data());
+    const size_t cpu_storage_bytes = cpu_tensor->storage().nbytes();
 
     // Get SpyreTensorLayout using the public API
     SpyreTensorLayout stl = get_spyre_tensor_layout(*dev_tensor);
 
-    DataConversionInfo dci = generate_dci(
-        cpu_tensor, dev_tensor, stl, cpu_tensor->storage_offset(), host2device);
+    DataConversionInfo dci =
+        generate_dci(cpu_tensor, dev_tensor, stl, host2device);
 
-    copyAsyncImpl(cpu_ptr, get_composite_address(*dev_tensor), &dci,
-                  host2device);
+    copyAsyncImpl(cpu_ptr, cpu_storage_bytes,
+                  get_composite_address(*dev_tensor), &dci, host2device);
 
   } else {
     TORCH_CHECK(false, "Unsupported copy types: src on ", src.device(),
@@ -222,7 +226,7 @@ SpyreStreamError SpyreStream::getError() const {
                                                  : SpyreStreamError::Success;
 }
 
-void SpyreStream::copyAsyncImpl(void* cpu_ptr,
+void SpyreStream::copyAsyncImpl(void* cpu_ptr, size_t cpu_storage_bytes,
                                 const flex::CompositeAddress* device_address,
                                 const DataConversionInfo* dci,
                                 bool host2device) const {
@@ -237,9 +241,16 @@ void SpyreStream::copyAsyncImpl(void* cpu_ptr,
     launchH2D(params);
     flex::destroyDmaParams(params);
   } else {
+    // Pass the true host buffer capacity so flex can give ConvertData the
+    // correct out_capacity_bytes for dtype-upscaling D2H transfers (e.g.
+    // bf16→fp32), where the host buffer is larger than the device staging
+    // buffer.
     auto* params =
         flex::createDmaParams(cpu_ptr, device_address->total_size(),
-                              host2device, device_address, std::move(dci_ptr));
+                              host2device, device_address, std::move(dci_ptr),
+                              /*iova=*/nullptr, /*use_compute_pipeline=*/false,
+                              /*pipeline_barrier=*/false, /*skip_hazard=*/false,
+                              /*host_capacity_bytes=*/cpu_storage_bytes);
     launchD2H(params);
     flex::destroyDmaParams(params);
   }
@@ -269,6 +280,12 @@ void SpyreStream::fillAsync(const flex::CompositeAddress* dst, double value,
                             DataFormats dtype, bool use_dmai) const {
   RECORD_FUNCTION("launch::Memset", {});
   resolveRuntimeHandle()->fillAsync(dst, value, dtype, use_dmai);
+}
+
+flex::HostComputeBuffer* SpyreStream::launchHostCompute(
+    flex::HostComputeParams* params) const {
+  RECORD_FUNCTION("launch::HostCompute", {});
+  return resolveRuntimeHandle()->launchHostCompute(params);
 }
 
 void SpyreStream::launch(const JobPlan& plan,

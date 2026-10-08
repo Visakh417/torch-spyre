@@ -23,6 +23,7 @@ from itertools import permutations
 from typing import Any, Callable
 
 from sympy import Expr, Integer, Mod, Symbol, floor, sympify
+from sympy.utilities.misc import as_int
 
 from torch_spyre._C import DataFormats, get_device_size_in_bytes
 from .op_spec import TensorWorkDivision
@@ -75,7 +76,9 @@ def owner_slots(
 
     if num_cores <= 0:
         raise ValueError(f"physical core count must be positive, got {num_cores}")
-    if splits.keys() != slots.keys():
+    try:
+        formulas = {dim: sympify(slots[dim]) for dim in splits}
+    except KeyError:
         raise ValueError(
             "ownership split and owner-slot dimensions differ: "
             f"{sorted(map(str, splits))} != {sorted(map(str, slots))}"
@@ -84,16 +87,49 @@ def owner_slots(
     for core in range(num_cores):
         row = {}
         for dim, split in splits.items():
-            value = _owner_at_core(sympify(slots[dim]), core)
-            if value.free_symbols or value.is_integer is not True:
+            value = _owner_at_core(formulas[dim], core)
+            try:
+                int_value = as_int(value, strict=True)
+            except ValueError:
                 raise ValueError(f"non-integral owner slot {value} on core {core}")
-            if not 0 <= int(value) < int(split):
+            if not 0 <= int_value < split:
                 raise ValueError(
-                    f"owner slot {int(value)} outside split {split} on core {core}"
+                    f"owner slot {int_value} outside split {split} on core {core}"
                 )
-            row[dim] = int(value)
+            row[dim] = int_value
         rows.append(row)
     return tuple(rows)
+
+
+def _overlap(a: int, an: int, b: int, bn: int) -> bool:
+    return a * bn < (b + 1) * an and b * an < (a + 1) * bn
+
+
+def transfer_edges(
+    source_splits: Mapping[Any, int],
+    destination_splits: Mapping[Any, int],
+    source_map: Mapping[int, Mapping[Any, int]],
+    destination_map: Mapping[int, Mapping[Any, int]],
+) -> set[tuple[int, int]]:
+    """Ownership intersections for ordinary and completed-result copies.
+
+    Both partitions must describe the same coordinate domain.
+    """
+    all_splits = source_splits.keys() | destination_splits.keys()
+    result = set()
+    for s_core, s_slice in source_map.items():
+        for d_core, d_slice in destination_map.items():
+            for dim in all_splits:
+                if not _overlap(
+                    s_slice.get(dim, 0),
+                    source_splits.get(dim, 1),
+                    d_slice.get(dim, 0),
+                    destination_splits.get(dim, 1),
+                ):
+                    break
+            else:
+                result.add((s_core, d_core))
+    return result
 
 
 def same_owner_maps(
@@ -109,13 +145,16 @@ def same_owner_maps(
     Unsplit dimensions describe no ownership and are ignored. Equivalent SymPy
     spellings compare equal; a missing owner formula is a mismatch.
     """
-
-    left = {dim: int(split) for dim, split in left_splits.items() if int(split) > 1}
-    right = {dim: int(split) for dim, split in right_splits.items() if int(split) > 1}
-    if left != right or left_cores != right_cores:
+    if left_cores <= 0:
         return False
-    if not left:
+    if left_cores != right_cores:
+        return False
+    left = {dim: split for dim, split in left_splits.items() if split > 1}
+    right = {dim: split for dim, split in right_splits.items() if split > 1}
+    if not left and not right:
         return True
+    if left != right:
+        return False
     try:
         return core_mappings_equal(
             {dim: left_slots[dim] for dim in left},
@@ -365,7 +404,6 @@ def decompose_fused_split_view(
             fused_split,
             rectangles=True,
         )
-        origins = [tuple(low for low, _ in bounds) for bounds in regions]
         shapes = {tuple(high - low + 1 for low, high in bounds) for bounds in regions}
         if len(shapes) != 1:
             reject(
@@ -389,6 +427,7 @@ def decompose_fused_split_view(
             return None
 
         synthetic = {axis: Symbol(f"physical_dim_{axis}") for axis in driven}
+        origins = [tuple(low for low, _ in bounds) for bounds in regions]
         expected = tuple(
             {
                 synthetic[axis]: lo // width
@@ -661,6 +700,46 @@ def derive_partition_mapping(
     }
 
 
+def distribute_aligned_split(split: int, bases: Sequence[int]) -> tuple[list[int], int]:
+    """Factor one loop dimension's ``split`` over its aligned segments.
+
+    ``align_tensors`` cuts a loop dimension into segments, listed innermost
+    first with their extents in ``bases``. The outermost segment takes
+    ``gcd(split, basis)`` first and passes the rest inward. Returns the factor
+    each segment receives, innermost first, and what is left undistributed.
+    """
+    factors = []
+    remaining = int(split)
+    for basis in reversed(bases):
+        factor = math.gcd(remaining, int(basis))
+        factors.append(factor)
+        remaining //= factor
+    factors.reverse()
+    return factors, remaining
+
+
+def aligned_split_keeps_blocks(split: int, bases: Sequence[int]) -> bool:
+    """Whether ``split`` still gives each core one contiguous block once aligned.
+
+    The scratchpad planner, and a consumer on the same division, take an
+    ``n``-way split of a dimension to mean ``n`` contiguous blocks. The
+    distribution in :func:`distribute_aligned_split` agrees only while every
+    segment outside the innermost split one is split whole. Otherwise the
+    split lands on an inner segment and interleaves the owners: a 2-way split
+    of ``d0 < 6`` cut into segments of extent 2 and 3 (a ``repeat`` read of
+    ``Mod(d0, 2)``) gives core 0 rows {0, 2, 4}, not {0, 1, 2}.
+    """
+    factors, remaining = distribute_aligned_split(split, bases)
+    if remaining != 1:
+        return False
+    split_inside = False
+    for factor, basis in zip(reversed(factors), reversed(bases)):
+        if split_inside and factor > 1:
+            return False
+        split_inside = split_inside or factor < int(basis)
+    return True
+
+
 def remap_work_division(
     division: TensorWorkDivision,
     dimension_remap: Mapping[Symbol, Sequence[tuple[Symbol, int]]],
@@ -668,7 +747,9 @@ def remap_work_division(
     """Express tensor ownership in an aligned iteration space.
 
     ``align_tensors`` may split one loop dimension into several dimensions. The
-    physical partition does not change; only the symbols used to describe it do.
+    physical partition does not change; only the symbols used to describe it
+    do. That holds only for a split that :func:`aligned_split_keeps_blocks`
+    admits, which the work-division constraints enforce upstream.
     """
 
     num_cores = division.physical_core_count
@@ -684,11 +765,12 @@ def remap_work_division(
             split_factors = [(new_dims[0][0], remaining_split)]
             remaining_split = 1
         else:
-            for new_dim, basis in reversed(new_dims):
-                factor = math.gcd(remaining_split, int(basis))
-                split_factors.append((new_dim, factor))
-                remaining_split //= factor
-            split_factors.reverse()
+            factors, remaining_split = distribute_aligned_split(
+                remaining_split, [basis for _, basis in new_dims]
+            )
+            split_factors = [
+                (new_dim, factor) for (new_dim, _), factor in zip(new_dims, factors)
+            ]
         if remaining_split != 1:
             raise ValueError(f"cannot normalize {split}-way split on {old_dim}")
 
@@ -841,22 +923,18 @@ def derive_operation_mapping(
     raise ValueError("no operation core mapping satisfies every LX tensor owner")
 
 
-def partition_physical_span_bytes(
+def partition_lx_size_bytes(
     device_size: Sequence[int],
     device_dtype: DataFormats,
     split_by_device_dim: Mapping[int, int],
 ) -> int:
-    """Bound a normalized standard-layout partition, including gaps between rows.
+    """Size one core's packed slice of a normalized standard device layout.
 
-    Device dimensions are stored in decreasing physical-stride order. The
-    layout's ``stride_map`` instead addresses HOST memory and must not size LX.
-    A backend may pack a partition more tightly; retaining the original device
-    strides is a conservative bound. The caller must supply a final dimension
-    of exactly ``device_dtype.elems_per_stick()`` elements, with no split on
-    that axis. Host-shape SpyreTensorLayout construction provides this form;
-    an explicit device shape is not guaranteed to. Non-positive extents and
-    invalid split axes/factors also raise ValueError, never a guessed size.
-    This measures placement, not the split-cost estimate.
+    LX stores the local extents, not the gaps between cores' slices in the
+    whole tensor. Use this member's physical splits: replicated consumers need
+    more storage than tensor size divided by the communication core count.
+    Device extents include padding; the final axis must be a complete unsplit
+    stick. Reject uneven slices, whose local storage is not described here.
     """
 
     if not device_size or any(extent <= 0 for extent in device_size):
@@ -868,18 +946,21 @@ def partition_physical_span_bytes(
         if dim < 0 or dim >= len(device_size) or split <= 0:
             raise ValueError(f"invalid split {split} on device dimension {dim}")
     if device_size[-1] != elems_per_stick:
-        raise ValueError("physical span requires one complete final stick dimension")
+        raise ValueError("LX size requires one complete final stick dimension")
     if split_by_device_dim.get(len(device_size) - 1, 1) != 1:
         raise ValueError("the final stick dimension cannot be split")
 
-    span_sticks = stride_sticks = 1
-    for dim in reversed(range(len(device_size) - 1)):
-        extent = device_size[dim]
+    per_core_size = []
+    for dim, extent in enumerate(device_size):
         split = split_by_device_dim.get(dim, 1)
-        slice_extent = (extent + split - 1) // split
-        span_sticks += (slice_extent - 1) * stride_sticks
-        stride_sticks *= extent
-    return get_device_size_in_bytes([span_sticks, elems_per_stick], device_dtype)
+        if extent % split:
+            raise ValueError(f"device extent {extent} is not divisible by {split}")
+        per_core_size.append(extent // split)
+    return get_device_size_in_bytes(per_core_size, device_dtype)
+
+
+def _comparable(expr):
+    return expr if not isinstance(expr, Expr) else str(expr)
 
 
 def core_mappings_equal(
@@ -887,25 +968,53 @@ def core_mappings_equal(
     right: Mapping[Any, Expr],
     num_cores: int,
 ) -> bool:
-    """Return whether two symbolic mappings assign every core identically."""
+    """Return whether two symbolic mappings assign every core identically.
 
-    if left.keys() != right.keys():
-        return False
+    Memoized on the two mappings: the planner compares the same handful of
+    owner formulas thousands of times (view interning, the slicing-match gate
+    and the movement gate all go through here, and structurally identical ops
+    such as attention's unrolled KV blocks induce identical views). Profiled
+    on a 304-op graph this was 5 million ``sympify`` calls.
+    """
+
     if num_cores <= 0:
         return False
+    if left.keys() != right.keys():
+        return False
+
     try:
-        for dim in left:
+        key_left = tuple(
+            sorted(
+                ((_comparable(d), sympify(e)) for d, e in left.items()),
+                key=lambda kv: kv[0],
+            )
+        )
+        key_right = tuple(
+            sorted(
+                ((_comparable(d), sympify(e)) for d, e in right.items()),
+                key=lambda kv: kv[0],
+            )
+        )
+    except (TypeError, ValueError):
+        return False
+    return _core_mappings_equal_cached(key_left, key_right, num_cores)
+
+
+@lru_cache(maxsize=65536)
+def _core_mappings_equal_cached(
+    left: tuple[tuple[Any, Expr], ...],
+    right: tuple[tuple[Any, Expr], ...],
+    num_cores: int,
+) -> bool:
+    try:
+        for (_, lf), (_, rf) in zip(left, right):
             for core in range(num_cores):
-                values = [
-                    _owner_at_core(sympify(mapping[dim]), core)
-                    for mapping in (left, right)
-                ]
-                if any(
-                    value.free_symbols or value.is_integer is not True
-                    for value in values
-                ):
-                    return False
-                if values[0] != values[1]:
+                try:
+                    l_val = as_int(_owner_at_core(lf, core))
+                    r_val = as_int(_owner_at_core(rf, core))
+                    if l_val != r_val:
+                        return False
+                except ValueError:
                     return False
         return True
     except (TypeError, ValueError):
