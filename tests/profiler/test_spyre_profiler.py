@@ -68,14 +68,10 @@ def _find_shifted_kernel_timestamps(events):
         shifted: subset of pairs where kernel_event["ts"] < cpu_event["ts"]
     """
     cpu_ev_by_corr: dict[int, dict] = {}
+    kernel_evs: list[dict] = []
+
     for ev in events:
-        if not isinstance(ev, dict):
-            continue
-        if (
-            ev.get("ph") != "X"
-            or ev.get("cat") != "privateuse1_runtime"
-            or ev.get("name") != "aiuLaunchControlBlocks"
-        ):
+        if not isinstance(ev, dict) or ev.get("ph") != "X":
             continue
         ts = ev.get("ts")
         if not (
@@ -87,26 +83,19 @@ def _find_shifted_kernel_timestamps(events):
         corr = ev.get("args", {}).get("correlation")
         if corr is None:
             continue
-        cpu_ev_by_corr[int(corr)] = ev
-
-    pairs = []
-    for ev in events:
-        if not isinstance(ev, dict):
-            continue
-        if ev.get("ph") != "X" or ev.get("cat") != "kernel":
-            continue
-        ts = ev.get("ts")
-        if not (
-            isinstance(ts, (int, float))
-            and not isinstance(ts, bool)
-            and math.isfinite(ts)
+        if (
+            ev.get("cat") == "privateuse1_runtime"
+            and ev.get("name") == "aiuLaunchControlBlocks"
         ):
-            continue
-        corr = ev.get("args", {}).get("correlation")
-        if corr is None or int(corr) not in cpu_ev_by_corr:
-            continue
-        pairs.append((cpu_ev_by_corr[int(corr)], ev))
+            cpu_ev_by_corr[int(corr)] = ev
+        elif ev.get("cat") == "kernel":
+            kernel_evs.append(ev)
 
+    pairs = [
+        (cpu_ev_by_corr[int(ev["args"]["correlation"])], ev)
+        for ev in kernel_evs
+        if int(ev["args"]["correlation"]) in cpu_ev_by_corr
+    ]
     shifted = [(cpu_ev, k_ev) for cpu_ev, k_ev in pairs if k_ev["ts"] < cpu_ev["ts"]]
     return pairs, shifted
 
@@ -227,21 +216,24 @@ class TestSpyreProfiler(TestCase):
     def test_kernel_timestamp_after_cpu_dispatch(self):
         """Verify every Spyre kernel starts after its CPU dispatch event.
 
-        Correlates ``cat == "privateuse1_runtime"`` CPU launch events with
+        Correlates ``aiuLaunchControlBlocks`` CPU launch events with
         ``cat == "kernel"`` hardware events via ``args["correlation"]``.  A
         negative delta (kernel.ts < cpu_launch.ts) indicates the Spyre
         hardware clock and the host clock are not correctly correlated —
         the "shifted timestamp" bug.
+
+        The workload uses large repeated matmuls to push total kernel execution
+        time past ~2 s, increasing the probability of a hardware timer
+        wrap-around that would surface the bug.
         """
-        x = torch.randn((64, 64), dtype=torch.float16, device="spyre")
-        y = torch.randn((64, 64), dtype=torch.float16, device="spyre")
+        x = torch.randn((2048, 2048), dtype=torch.float16, device="spyre")
+        y = torch.randn((2048, 2048), dtype=torch.float16, device="spyre")
 
         with profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]
         ) as prof:
-            result = torch.matmul(x, y)
-            result = F.gelu(result)
-            result = torch.sum(result)
+            for _ in range(8):
+                torch.matmul(x, y)
             torch.spyre.synchronize()
 
         with TemporaryFileName(mode="w+") as fname:
